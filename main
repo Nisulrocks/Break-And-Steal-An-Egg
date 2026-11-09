@@ -1,0 +1,1090 @@
+-- Egg autofarm with Rayfield UI
+-- Loop: go to zone -> break selected eggs -> steal good animals -> run them home -> repeat
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+local Workspace = game:GetService("Workspace")
+local GuiService = game:GetService("GuiService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local CONFIG = {
+	PollRate = 0.1,
+	WaypointTimeout = 3,
+	WaypointReach = 4,
+	PathGoalTimeout = 40,
+	EggReach = 1.5,
+	EggTimeout = 120,
+	ZoneReach = 25,
+	StealReach = 5,
+	StealWaitTime = 1.5,
+	HomeReach = 6,
+	MaxStealAttempts = 5,
+}
+
+local PATH_PARAMS = {
+	AgentRadius = 2,
+	AgentHeight = 5,
+	AgentCanJump = true,
+	WaypointSpacing = 12,
+}
+
+local SUFFIXES = {
+	k = 1e3, m = 1e6, b = 1e9, t = 1e12,
+	qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24,
+	oc = 1e27, no = 1e30, dc = 1e33,
+	ud = 1e36, dd = 1e39, td = 1e42, qd = 1e45,
+}
+
+-- Zone build folder is workspace.Build.ZoneBuilds[Build]
+-- Egg folder is ReplicatedStorage.Eggs.NormalEggs[EggFolder]
+local ZONES = {
+	{ Name = "Zone 1", EggFolder = "Forest Eggs", Build = "Zone1" },
+	{ Name = "Zone 2", EggFolder = "Desert Eggs", Build = "Zone2" },
+	{ Name = "Zone 3", EggFolder = "Snowy Eggs", Build = "Zone3" },
+	{ Name = "Zone 4", EggFolder = "Candy Eggs", Build = "Zone4" },
+	{ Name = "Zone 5", EggFolder = "Lake Eggs", Build = "Zone5" },
+	{ Name = "Zone 6", EggFolder = "Under Water Eggs", Build = "Zone6" },
+	{ Name = "Zone 7", EggFolder = "Volcano Eggs", Build = "Zone7" },
+	{ Name = "Zone 8", EggFolder = "Blossom Eggs", Build = "Zone8" },
+	{ Name = "Zone 9", EggFolder = "Galaxy Eggs", Build = "Zone9" },
+	{ Name = "Zone 10", EggFolder = "Alien Eggs", Build = "Zone10" },
+	{ Name = "Zone 11", EggFolder = "Zone_11", Build = "Zone11" },
+	{ Name = "Zone 12", EggFolder = "FairyEgg", Build = "Zone12" },
+	{ Name = "Zone 13", EggFolder = "FantasyExpansion", Build = "Zone13" },
+}
+
+local zoneNames = {}
+local zoneByName = {}
+for _, zone in ipairs(ZONES) do
+	table.insert(zoneNames, zone.Name)
+	zoneByName[zone.Name] = zone
+end
+
+local state = {
+	running = false,
+	spawnPart = nil,
+	minCps = 0,
+	zone = ZONES[1],
+	selectedEggs = {},
+	stealAttempts = {},
+	lastEquipPress = 0,
+	lastPath = "none",
+	noHpEggs = {},
+}
+
+local farmToggle
+local eggDropdown
+local statusLabel
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+local function notify(title, content)
+	Rayfield:Notify({ Title = title, Content = content, Duration = 3 })
+end
+
+local function setStatus(text)
+	if statusLabel then
+		pcall(function()
+			statusLabel:Set("Status: " .. text)
+		end)
+	end
+end
+
+local function parseMoney(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+
+	-- "$11.1B/s" -> "11.1B"
+	local cleaned = text:gsub("[%$,%s]", ""):gsub("/%a+$", "")
+	local number, suffix = cleaned:match("^(%d+%.?%d*)(%a*)$")
+	if not number then
+		return nil
+	end
+
+	local multiplier = 1
+	if suffix ~= "" then
+		multiplier = SUFFIXES[suffix:lower()]
+		if not multiplier then
+			return nil
+		end
+	end
+
+	return tonumber(number) * multiplier
+end
+
+local function getPosition(instance)
+	if not instance then
+		return nil
+	end
+	if instance:IsA("Attachment") then
+		return instance.WorldPosition
+	end
+	if instance:IsA("BasePart") or instance:IsA("Model") then
+		return instance:GetPivot().Position
+	end
+	return nil
+end
+
+local function flatDistance(a, b)
+	return ((a - b) * Vector3.new(1, 0, 1)).Magnitude
+end
+
+local function findChildPath(root, names)
+	local current = root
+	for _, name in ipairs(names) do
+		if not current then
+			return nil
+		end
+		current = current:FindFirstChild(name)
+	end
+	return current
+end
+
+-- Drops a point onto the ground so pathfinding has a walkable goal (eggs and animals sit above the floor)
+local function groundPoint(position, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local result = Workspace:Raycast(position + Vector3.new(0, 3, 0), Vector3.new(0, -200, 0), params)
+	if result then
+		return result.Position
+	end
+	return position
+end
+
+local function getCharacter()
+	local char = LocalPlayer.Character
+	if not char then
+		return nil
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		return char, hum, root
+	end
+	return nil
+end
+
+----------------------------------------------------------------------
+-- World lookups
+----------------------------------------------------------------------
+
+local function findMyPlot()
+	local plots = Workspace:FindFirstChild("Plots")
+	if not plots then
+		return nil
+	end
+	for _, plot in ipairs(plots:GetChildren()) do
+		if tostring(plot:GetAttribute("OwnerUserId")) == tostring(LocalPlayer.UserId) then
+			return plot
+		end
+	end
+	return nil
+end
+
+local function getZoneBuild(zone)
+	local build = Workspace:FindFirstChild("Build")
+	local zoneBuilds = build and build:FindFirstChild("ZoneBuilds")
+	return zoneBuilds and zoneBuilds:FindFirstChild(zone.Build)
+end
+
+-- Hitboxes are named by zone number (e.g. ZoneHitboxes["13"]) and stay loaded even when the zone itself isn't
+local function getZoneHitbox(zone)
+	local build = Workspace:FindFirstChild("Build")
+	local hitboxes = build and build:FindFirstChild("ZoneHitboxes")
+	local number = zone.Build:match("%d+")
+	return hitboxes and number and hitboxes:FindFirstChild(number)
+end
+
+local function getZoneEggsFolder(zone)
+	local zoneBuild = getZoneBuild(zone)
+	return zoneBuild and zoneBuild:FindFirstChild("Eggs")
+end
+
+local function getEggNames(zone)
+	local names = {}
+	local eggs = ReplicatedStorage:FindFirstChild("Eggs")
+	local normal = eggs and eggs:FindFirstChild("NormalEggs")
+	local folder = normal and normal:FindFirstChild(zone.EggFolder)
+	if folder then
+		for _, egg in ipairs(folder:GetChildren()) do
+			table.insert(names, egg.Name)
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+local function isCarrying()
+	local carried = Workspace:FindFirstChild("CarriedAnimals")
+	return carried ~= nil and #carried:GetChildren() > 0
+end
+
+-- Reads "$11.1B/s" from the animal's overhead
+local function readCashPerSecond(animal)
+	local label = findChildPath(animal, {
+		"RootPart", "AnimalOverheadAttachment", "AnimalOverhead", "CashPerSecond", "CashPerSecond",
+	})
+	if label and label:IsA("TextLabel") then
+		return parseMoney(label.Text)
+	end
+	return nil
+end
+
+-- Highest earning hatched animal that meets the threshold and hasn't failed too many times
+local function findTargetAnimal()
+	local pickups = Workspace:FindFirstChild("AnimalPickups")
+	if not pickups then
+		return nil
+	end
+
+	local best, bestValue = nil, -1
+	for _, animal in ipairs(pickups:GetChildren()) do
+		local value = readCashPerSecond(animal)
+		local attempts = state.stealAttempts[animal] or 0
+		if value and value >= state.minCps and value > bestValue and attempts < CONFIG.MaxStealAttempts then
+			best, bestValue = animal, value
+		end
+	end
+	return best
+end
+
+-- The steal prompts are direct children of workspace, so pick the one closest to the animal
+local function findClosestStealPrompt(position)
+	local bestPrompt, bestDistance = nil, math.huge
+	for _, child in ipairs(Workspace:GetChildren()) do
+		local holder = child:FindFirstChild("StealPrompt")
+		if holder then
+			local prompt = holder:IsA("ProximityPrompt") and holder or holder:FindFirstChildWhichIsA("ProximityPrompt", true)
+			local promptPosition = getPosition(holder) or getPosition(child)
+			if prompt and promptPosition then
+				local distance = (promptPosition - position).Magnitude
+				if distance < bestDistance then
+					bestPrompt, bestDistance = prompt, distance
+				end
+			end
+		end
+	end
+	return bestPrompt
+end
+
+local function firePrompt(prompt)
+	if fireproximityprompt then
+		fireproximityprompt(prompt)
+	else
+		notify("Autofarm", "fireproximityprompt is not supported by this executor")
+	end
+end
+
+-- Egg HP text looks like "0/1.3Qa HP" when broken
+-- Finds the HP text inside the egg's EggInfoUi (the nesting under it can vary, so search for it)
+local function findEggHpLabel(egg)
+	local infoUi = egg:FindFirstChild("EggInfoUi", true)
+	return infoUi and infoUi:FindFirstChild("HpAmount", true)
+end
+
+local function getEggHpText(egg)
+	local label = findEggHpLabel(egg)
+	if not label then
+		return nil
+	end
+	local ok, text = pcall(function()
+		return label.Text
+	end)
+	if ok and type(text) == "string" then
+		return text
+	end
+	return nil
+end
+
+-- HP text looks like "0/1.3Qa HP" when broken
+local function isEggBroken(egg)
+	local text = getEggHpText(egg)
+	local current = text and text:match("^%s*([%d%.]+)")
+	return current ~= nil and tonumber(current) == 0
+end
+
+----------------------------------------------------------------------
+-- Movement
+----------------------------------------------------------------------
+
+-- Holds W/A/S/D with real key presses. Keys are only sent when a key's state changes.
+local MOVE_KEYS = {
+	W = Enum.KeyCode.W,
+	A = Enum.KeyCode.A,
+	S = Enum.KeyCode.S,
+	D = Enum.KeyCode.D,
+}
+local heldKeys = {}
+
+local function setKeyHeld(name, held)
+	if heldKeys[name] == held then
+		return
+	end
+	heldKeys[name] = held
+	VirtualInputManager:SendKeyEvent(held, MOVE_KEYS[name], false, game)
+end
+
+local function releaseMoveKeys()
+	for name in pairs(MOVE_KEYS) do
+		setKeyHeld(name, false)
+	end
+end
+
+-- Flattens a vector onto the ground, falling back if it points straight up or down
+local function flatUnit(vector, fallback)
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	if flat.Magnitude < 0.01 then
+		return fallback
+	end
+	return flat.Unit
+end
+
+-- Presses W/A/S/D relative to the camera, the same way the default controls do, so the character heads toward the point
+local function steerToward(point)
+	local _, _, root = getCharacter()
+	if not root then
+		return
+	end
+
+	local camera = Workspace.CurrentCamera
+	local forward = flatUnit(camera.CFrame.LookVector, Vector3.new(0, 0, -1))
+	local right = flatUnit(camera.CFrame.RightVector, Vector3.new(1, 0, 0))
+
+	local toPoint = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
+	if toPoint.Magnitude < 0.1 then
+		releaseMoveKeys()
+		return
+	end
+
+	local direction = toPoint.Unit
+	local alongForward = direction:Dot(forward)
+	local alongRight = direction:Dot(right)
+
+	setKeyHeld("W", alongForward > 0.38)
+	setKeyHeld("S", alongForward < -0.38)
+	setKeyHeld("D", alongRight > 0.38)
+	setKeyHeld("A", alongRight < -0.38)
+end
+
+-- True when nothing is in the way between two points, checked at about knee height
+local function clearLine(from, to, char)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char }
+
+	local origin = from + Vector3.new(0, 1, 0)
+	local destination = to + Vector3.new(0, 1, 0)
+	local result = Workspace:Raycast(origin, destination - origin, params)
+
+	-- A hit right at the destination is the target itself, which is fine
+	return result == nil or (result.Position - destination).Magnitude < 3
+end
+
+-- Computes a path to the goal and follows it without stopping at every waypoint.
+-- The next waypoint is aimed at as soon as the character is close to the current one,
+-- so the character keeps a steady walk instead of stop-start movement.
+local function followPath(goal, char, shouldStop, finalReach)
+	local _, hum, root = getCharacter()
+	if not hum then
+		return
+	end
+
+	-- Close with a clear line: walk straight there. This skips the path computation pause.
+	local direct = flatDistance(root.Position, goal) < 15 and clearLine(root.Position, goal, char)
+
+	local path = PathfindingService:CreatePath(PATH_PARAMS)
+	local ok = false
+	if not direct then
+		ok = pcall(function()
+			path:ComputeAsync(root.Position, goal)
+		end)
+	end
+
+	local waypoints
+	local blocked = false
+	local blockedConnection
+
+	state.lastPath = direct and "Direct" or (ok and path.Status.Name or "ComputeError")
+
+	if direct then
+		waypoints = { { Position = goal, Action = Enum.PathWaypointAction.Walk } }
+	elseif ok and path.Status == Enum.PathStatus.Success then
+		waypoints = path:GetWaypoints()
+		blockedConnection = path.Blocked:Connect(function()
+			blocked = true
+		end)
+	else
+		-- No usable path: walk straight toward the goal and let the caller recompute
+		waypoints = { { Position = goal, Action = Enum.PathWaypointAction.Walk } }
+	end
+
+	local function cancelled()
+		return blocked or shouldStop() or LocalPlayer.Character ~= char or hum.Health <= 0
+	end
+
+	-- Hold W/A/S/D like a player would, steering toward each waypoint in turn
+	local reach = math.clamp(hum.WalkSpeed * 0.15, CONFIG.WaypointReach, 16)
+	local index = 1
+	local waypointStart = os.clock()
+
+	while index <= #waypoints and not cancelled() do
+		local waypoint = waypoints[index]
+		-- The final waypoint is the target itself, so it uses the tight reach instead of the route reach
+		local threshold = index == #waypoints and finalReach or reach
+
+		if flatDistance(root.Position, waypoint.Position) <= threshold then
+			index += 1
+			waypointStart = os.clock()
+			if index <= #waypoints and waypoints[index].Action == Enum.PathWaypointAction.Jump then
+				hum.Jump = true
+			end
+		elseif os.clock() - waypointStart > CONFIG.WaypointTimeout then
+			break
+		else
+			-- Stuck against something for a moment, so try a jump
+			if os.clock() - waypointStart > 0.5 and root.AssemblyLinearVelocity.Magnitude < 1 then
+				hum.Jump = true
+			end
+			steerToward(waypoint.Position)
+		end
+
+		task.wait()
+	end
+
+	releaseMoveKeys()
+
+	if blockedConnection then
+		blockedConnection:Disconnect()
+	end
+end
+
+-- Warns in the console if the character hasn't moved for a few seconds while trying to walk
+local stallTracker = { position = nil, time = 0 }
+
+local function checkStalled(char)
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root then
+		return
+	end
+
+	if not stallTracker.position or flatDistance(root.Position, stallTracker.position) > 1 then
+		stallTracker.position = root.Position
+		stallTracker.time = os.clock()
+		return
+	end
+
+	if os.clock() - stallTracker.time > 3 then
+		warn(string.format(
+			"[Autofarm] Not moving for 3s. WalkSpeed=%s PlatformStand=%s Sit=%s State=%s Velocity=%.2f Path=%s",
+			tostring(hum.WalkSpeed), tostring(hum.PlatformStand), tostring(hum.Sit), tostring(hum:GetState()),
+			root.AssemblyLinearVelocity.Magnitude, state.lastPath
+		))
+		stallTracker.time = os.clock()
+	end
+end
+
+-- Keeps pathfinding toward an instance until within reach, stopped, or timed out
+local function goTo(target, reach, shouldStop, timeout)
+	local startTime = os.clock()
+	local _, _, startRoot = getCharacter()
+	local progressPosition = startRoot and startRoot.Position or Vector3.zero
+	local progressTime = os.clock()
+
+	while state.running and not shouldStop() and os.clock() - startTime < timeout do
+		local char, _, root = getCharacter()
+		if not char or not target.Parent then
+			return false
+		end
+
+		local position = getPosition(target)
+		if not position then
+			return false
+		end
+
+		if flatDistance(root.Position, position) <= reach then
+			return true
+		end
+
+		local goal = groundPoint(position, { char, target })
+		followPath(goal, char, shouldStop, reach)
+		checkStalled(char)
+
+		-- Give up if the character hasn't actually moved for a while, so the caller can try something else
+		if flatDistance(root.Position, progressPosition) > 1 then
+			progressPosition = root.Position
+			progressTime = os.clock()
+		elseif os.clock() - progressTime > 4 then
+			return false
+		end
+	end
+
+	return false
+end
+
+local function stopAlways()
+	return not state.running
+end
+
+-- Same as findTargetAnimal but refreshed at most every 0.25s, so per-frame checks stay cheap
+local targetCache = { animal = nil, time = 0 }
+
+local function findTargetAnimalCached()
+	if os.clock() - targetCache.time > 0.25 then
+		targetCache.animal = findTargetAnimal()
+		targetCache.time = os.clock()
+	end
+	return targetCache.animal
+end
+
+-- Stop walking when we are free to grab a dropped/caught animal
+local function stopForSteal()
+	return not state.running or (not isCarrying() and findTargetAnimalCached() ~= nil)
+end
+
+----------------------------------------------------------------------
+-- Tools and auto swing
+----------------------------------------------------------------------
+
+-- Presses the 1 key to equip hotbar slot 1 (the pickaxe). Only when nothing is held,
+-- since pressing the same slot again would unequip it.
+local function ensurePickaxe(char, hum)
+	if char:FindFirstChildOfClass("Tool") then
+		return
+	end
+	if os.clock() - state.lastEquipPress < 1 then
+		return
+	end
+	state.lastEquipPress = os.clock()
+
+	local ok = pcall(function()
+		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.One, false, game)
+		task.wait(0.05)
+		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.One, false, game)
+	end)
+
+	if not ok then
+		local backpack = LocalPlayer:FindFirstChild("Backpack")
+		local tool = backpack and backpack:FindFirstChildOfClass("Tool")
+		if tool then
+			hum:EquipTool(tool)
+		end
+	end
+end
+
+-- AutoSwingColorAlpha: 0 = off, 1 = on
+local function isAutoSwingOn(alpha)
+	return alpha.Value >= 0.5
+end
+
+-- Real mouse click at the button's centre, for when signals don't trigger its handler
+local function virtualClick(button)
+	local inset = GuiService:GetGuiInset()
+	local position = button.AbsolutePosition + button.AbsoluteSize / 2 + inset
+	VirtualInputManager:SendMouseButtonEvent(position.X, position.Y, 0, true, game, 0)
+	task.wait(0.05)
+	VirtualInputManager:SendMouseButtonEvent(position.X, position.Y, 0, false, game, 0)
+end
+
+-- Clicks the AutoSwing button until AutoSwingColorAlpha matches `on`.
+-- Each method gets time to take effect before the next one is tried, so the button never gets toggled twice.
+local function setAutoSwing(on)
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
+	local button = mainGui and mainGui:FindFirstChild("AutoSwing")
+	local alpha = button and button:FindFirstChild("AutoSwingColorAlpha")
+
+	if not button or not alpha then
+		notify("Auto Swing", "Could not find AutoSwing.AutoSwingColorAlpha")
+		return
+	end
+
+	local methods = {
+		function() firesignal(button.MouseButton1Click) end,
+		function() firesignal(button.Activated) end,
+		function() virtualClick(button) end,
+	}
+
+	for _, method in ipairs(methods) do
+		if isAutoSwingOn(alpha) == on then
+			return
+		end
+
+		pcall(method)
+
+		local startTime = os.clock()
+		while isAutoSwingOn(alpha) ~= on and os.clock() - startTime < 1.5 do
+			task.wait(0.1)
+		end
+	end
+
+	if isAutoSwingOn(alpha) ~= on then
+		notify("Auto Swing", "Could not change AutoSwing, none of the click methods worked")
+	end
+end
+
+----------------------------------------------------------------------
+-- Actions
+----------------------------------------------------------------------
+
+local function stealAnimal(animal)
+	local animalPosition = getPosition(animal)
+	local prompt = animalPosition and findClosestStealPrompt(animalPosition)
+	if not prompt then
+		notify("Steal", "No steal prompt found near the animal")
+		task.wait(1)
+		return
+	end
+
+	local arrived = goTo(animal, CONFIG.StealReach, stopAlways, CONFIG.PathGoalTimeout)
+	if not arrived or not state.running then
+		state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
+		return
+	end
+
+	firePrompt(prompt)
+
+	-- Continue as soon as the animal shows up in CarriedAnimals instead of waiting the full time
+	local startTime = os.clock()
+	while not isCarrying() and os.clock() - startTime < CONFIG.StealWaitTime do
+		task.wait(CONFIG.PollRate)
+	end
+
+	if isCarrying() then
+		notify("Steal", "Picked up " .. animal.Name)
+	else
+		state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
+	end
+end
+
+local function breakEgg(egg)
+	-- Without the HP text the egg can't be checked, so log what's inside it and skip it for a while
+	if not findEggHpLabel(egg) then
+		print("[Autofarm] No HP text found on " .. egg.Name .. ", text labels inside it:")
+		for _, descendant in ipairs(egg:GetDescendants()) do
+			if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+				print("  " .. descendant:GetFullName())
+			end
+		end
+		setStatus("No HP text on " .. egg.Name .. ", skipping for now")
+		state.noHpEggs[egg] = os.clock() + 10
+		return
+	end
+
+	local startTime = os.clock()
+
+	while state.running and egg.Parent and not isEggBroken(egg) do
+		if stopForSteal() or os.clock() - startTime > CONFIG.EggTimeout then
+			return
+		end
+
+		local char, hum, root = getCharacter()
+		if not char then
+			return
+		end
+
+		ensurePickaxe(char, hum)
+
+		local eggPosition = getPosition(egg)
+		if not eggPosition then
+			return
+		end
+
+		if flatDistance(root.Position, eggPosition) > CONFIG.EggReach then
+			goTo(egg, CONFIG.EggReach, stopForSteal, CONFIG.PathGoalTimeout)
+		else
+			task.wait(CONFIG.PollRate)
+		end
+	end
+end
+
+-- Closest selected egg that isn't broken yet, measured from the player
+local function findNearestSelectedEgg(eggsFolder)
+	local _, _, root = getCharacter()
+	if not root then
+		return nil
+	end
+
+	local best, bestDistance = nil, math.huge
+	for _, egg in ipairs(eggsFolder:GetChildren()) do
+		local position = getPosition(egg)
+		if state.selectedEggs[egg.Name] and position and (state.noHpEggs[egg] or 0) < os.clock() and not isEggBroken(egg) then
+			local distance = flatDistance(root.Position, position)
+			if distance < bestDistance then
+				best, bestDistance = egg, distance
+			end
+		end
+	end
+	return best
+end
+
+local function farmZone()
+	local zone = state.zone
+	local eggsFolder = getZoneEggsFolder(zone)
+	local zoneEggs = eggsFolder and eggsFolder:GetChildren() or {}
+
+	-- Far zones may not have their eggs loaded yet, so walk to the zone building and wait for them
+	if #zoneEggs == 0 then
+		local hitbox = getZoneHitbox(zone)
+		local zoneTarget
+		if hitbox then
+			zoneTarget = (hitbox:IsA("Model") or hitbox:IsA("BasePart")) and hitbox
+				or hitbox:FindFirstChildWhichIsA("BasePart", true)
+		end
+
+		if not zoneTarget then
+			setStatus("Waiting for " .. zone.Name .. " to load")
+			task.wait(1)
+			return
+		end
+
+		setStatus("Going to " .. zone.Name)
+		goTo(zoneTarget, CONFIG.ZoneReach, stopForSteal, CONFIG.PathGoalTimeout)
+
+		setStatus("Waiting for " .. zone.Name .. " eggs to load")
+		while state.running and not stopForSteal() do
+			eggsFolder = getZoneEggsFolder(zone)
+			if eggsFolder and #eggsFolder:GetChildren() > 0 then
+				break
+			end
+			task.wait(0.5)
+		end
+		return
+	end
+
+	-- Walk into the zone first if we're not already near its eggs
+	local _, _, root = getCharacter()
+	local inZone = false
+	if root then
+		for _, egg in ipairs(zoneEggs) do
+			local position = getPosition(egg)
+			if position and flatDistance(root.Position, position) < 80 then
+				inZone = true
+				break
+			end
+		end
+	end
+	if not inZone then
+		goTo(zoneEggs[1], CONFIG.ZoneReach, stopForSteal, CONFIG.PathGoalTimeout)
+		return
+	end
+
+	-- Break the closest selected egg each time until none are left
+	while state.running and not stopForSteal() do
+		local egg = findNearestSelectedEgg(eggsFolder)
+		if not egg then
+			break
+		end
+		breakEgg(egg)
+	end
+
+	if next(state.selectedEggs) == nil then
+		task.wait(1)
+	end
+end
+
+local function deliverAnimal()
+	setStatus("Running animal back to base")
+	local arrived = goTo(state.spawnPart, CONFIG.HomeReach, stopForSteal, CONFIG.PathGoalTimeout)
+	if not arrived and state.running and isCarrying() then
+		setStatus("Base route failed, retrying")
+	end
+
+	if arrived then
+		-- Wait for the animal to be secured at base, then bring the pickaxe back out
+		local startTime = os.clock()
+		while state.running and isCarrying() and os.clock() - startTime < 5 do
+			task.wait(CONFIG.PollRate)
+		end
+
+		local char, hum = getCharacter()
+		if char and not isCarrying() then
+			setStatus("Re-equipping pickaxe")
+			state.lastEquipPress = 0
+			ensurePickaxe(char, hum)
+		end
+	end
+
+	task.wait(0.5)
+end
+
+local function mainLoop()
+	while state.running do
+		local char = getCharacter()
+		if not char then
+			setStatus("Waiting for character")
+			task.wait(1)
+			continue
+		end
+
+		if isCarrying() then
+			deliverAnimal()
+		else
+			local target = findTargetAnimal()
+			if target then
+				setStatus("Stealing " .. target.Name)
+				stealAnimal(target)
+			else
+				setStatus("Farming eggs")
+				farmZone()
+			end
+		end
+
+		task.wait(CONFIG.PollRate)
+	end
+end
+
+-- Keeps the camera fixed behind the character, facing the direction it had when farming started.
+-- W/A/S/D are camera-relative, so a fixed camera keeps the steering correct.
+local cameraLock
+
+local function startCameraLock()
+	local camera = Workspace.CurrentCamera
+	local look = camera.CFrame.LookVector
+	local forward = Vector3.new(look.X, 0, look.Z)
+	if forward.Magnitude < 0.01 then
+		forward = Vector3.new(0, 0, -1)
+	end
+	forward = forward.Unit
+
+	camera.CameraType = Enum.CameraType.Scriptable
+	cameraLock = RunService.RenderStepped:Connect(function()
+		local _, _, root = getCharacter()
+		if not root then
+			return
+		end
+		local focus = root.Position + Vector3.new(0, 2, 0)
+		camera.CFrame = CFrame.lookAt(focus - forward * 12, focus)
+	end)
+end
+
+local function stopCameraLock()
+	if cameraLock then
+		cameraLock:Disconnect()
+		cameraLock = nil
+	end
+	Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+end
+
+local function stopFarm()
+	if not state.running then
+		return
+	end
+	state.running = false
+	stopCameraLock()
+	setAutoSwing(false)
+	notify("Autofarm", "Stopped")
+end
+
+local function startFarm()
+	if state.running then
+		return
+	end
+
+	-- When auto-executed the base may not be loaded yet, so give it time before giving up
+	local spawnPart
+	local waitStart = os.clock()
+	repeat
+		local plot = findMyPlot()
+		spawnPart = plot and plot:FindFirstChild("SpawnPoint")
+		if not spawnPart then
+			task.wait(1)
+		end
+	until spawnPart or os.clock() - waitStart > 30
+
+	if not spawnPart then
+		notify("Autofarm", "Could not find your base SpawnPoint")
+		pcall(function()
+			farmToggle:Set(false)
+		end)
+		return
+	end
+
+	state.spawnPart = spawnPart
+	state.stealAttempts = {}
+	state.running = true
+	startCameraLock()
+	notify("Autofarm", "Started")
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			setAutoSwing(true)
+			mainLoop()
+		end)
+		if not ok then
+			warn("[Autofarm] " .. tostring(err))
+			notify("Autofarm error", tostring(err))
+			stopFarm()
+			pcall(function()
+				farmToggle:Set(false)
+			end)
+		end
+	end)
+end
+
+local function setZone(zone)
+	state.zone = zone
+	state.selectedEggs = {}
+	if eggDropdown then
+		pcall(function()
+			eggDropdown:Refresh(getEggNames(zone))
+		end)
+	end
+end
+
+----------------------------------------------------------------------
+-- Rayfield UI
+----------------------------------------------------------------------
+
+-- Prints each hatched animal's raw cash/s text and the value the script reads from it
+local function printAnimalValues()
+	print("[Autofarm] Threshold (parsed):", state.minCps)
+
+	local pickups = Workspace:FindFirstChild("AnimalPickups")
+	if not pickups then
+		print("[Autofarm] No AnimalPickups folder found")
+		notify("Animal values", "No AnimalPickups folder found")
+		return
+	end
+
+	for _, animal in ipairs(pickups:GetChildren()) do
+		local label = findChildPath(animal, {
+			"RootPart", "AnimalOverheadAttachment", "AnimalOverhead", "CashPerSecond", "CashPerSecond",
+		})
+		local rawText = label and label:IsA("TextLabel") and label.Text or "LABEL NOT FOUND"
+		print("[Autofarm]", animal.Name, "text:", rawText, "value:", readCashPerSecond(animal) or "nil")
+	end
+
+	notify("Animal values", "Printed to the console (F9)")
+end
+
+-- Prints the values that could control movement speed, so the real in-game speed source can be found
+local function printSpeedInfo()
+	local char, hum, root = getCharacter()
+	if not char then
+		notify("Speed info", "No character found")
+		return
+	end
+
+	-- Measure how far the character actually moves over half a second.
+	-- Hold W while pressing the button to measure your real walking speed.
+	local startPosition = root.Position
+	task.wait(0.5)
+	local measuredSpeed = flatDistance(root.Position, startPosition) / 0.5
+
+	print("[Autofarm] Humanoid.WalkSpeed:", hum.WalkSpeed)
+	print("[Autofarm] Measured flat speed over 0.5s:", measuredSpeed)
+	print("[Autofarm] Humanoid.WalkSpeed is default:", hum.WalkSpeed == 16)
+
+	for name, value in pairs(char:GetAttributes()) do
+		print("[Autofarm] Character attribute", name, value)
+	end
+	for name, value in pairs(hum:GetAttributes()) do
+		print("[Autofarm] Humanoid attribute", name, value)
+	end
+	for name, value in pairs(LocalPlayer:GetAttributes()) do
+		print("[Autofarm] Player attribute", name, value)
+	end
+
+	notify("Speed info", "WalkSpeed " .. tostring(hum.WalkSpeed) .. ", check the console (F9)")
+end
+
+local Window = Rayfield:CreateWindow({
+	Name = "Egg Autofarm",
+	LoadingTitle = "Egg Autofarm",
+	LoadingSubtitle = "Loading...",
+	ConfigurationSaving = {
+		Enabled = true,
+		FolderName = "EggAutofarm",
+		FileName = "Config",
+	},
+	Discord = { Enabled = false },
+	KeySystem = false,
+})
+
+local FarmTab = Window:CreateTab("Autofarm", 4483362458)
+
+statusLabel = FarmTab:CreateLabel("Status: Idle")
+
+FarmTab:CreateDropdown({
+	Name = "Zone",
+	Options = zoneNames,
+	CurrentOption = { zoneNames[1] },
+	MultipleOptions = false,
+	Flag = "ZoneDropdown",
+	Callback = function(option)
+		local name = type(option) == "table" and option[1] or option
+		local zone = zoneByName[name]
+		if zone then
+			setZone(zone)
+		end
+	end,
+})
+
+eggDropdown = FarmTab:CreateDropdown({
+	Name = "Eggs",
+	Options = getEggNames(state.zone),
+	CurrentOption = {},
+	MultipleOptions = true,
+	Flag = "EggDropdown",
+	Callback = function(options)
+		local selected = {}
+		if type(options) == "table" then
+			for _, name in ipairs(options) do
+				selected[name] = true
+			end
+		end
+		state.selectedEggs = selected
+	end,
+})
+
+FarmTab:CreateInput({
+	Name = "Min Cash/s",
+	PlaceholderText = "e.g. 20T",
+	RemoveTextAfterFocusLost = false,
+	Flag = "MinCashPerSecond",
+	Callback = function(text)
+		local value = parseMoney(text)
+		if value then
+			state.minCps = value
+			print("[Autofarm] Threshold set to", value, "from input", text)
+			notify("Threshold", "Stealing animals above " .. text)
+		else
+			notify("Threshold", "Could not read that value, use a format like 20T or 1.5B")
+		end
+	end,
+})
+
+farmToggle = FarmTab:CreateToggle({
+	Name = "Autofarm",
+	CurrentValue = false,
+	Flag = "AutofarmToggle",
+	Callback = function(value)
+		if value then
+			startFarm()
+		else
+			stopFarm()
+		end
+	end,
+})
+
+FarmTab:CreateButton({
+	Name = "Print speed info",
+	Callback = printSpeedInfo,
+})
+
+FarmTab:CreateButton({
+	Name = "Print animal values",
+	Callback = printAnimalValues,
+})
