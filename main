@@ -75,7 +75,6 @@ local state = {
 	stealAttempts = {},
 	lastEquipPress = 0,
 	lastPath = "none",
-	noHpEggs = {},
 }
 
 local farmToggle
@@ -307,10 +306,13 @@ local function getEggHpText(egg)
 	return nil
 end
 
--- HP text looks like "0/1.3Qa HP" when broken
+-- HP text looks like "0/1.3Qa HP" when broken. Once an egg breaks its HP text is removed, so missing text also means broken.
 local function isEggBroken(egg)
 	local text = getEggHpText(egg)
-	local current = text and text:match("^%s*([%d%.]+)")
+	if not text then
+		return true
+	end
+	local current = text:match("^%s*([%d%.]+)")
 	return current ~= nil and tonumber(current) == 0
 end
 
@@ -669,16 +671,7 @@ local function stealAnimal(animal)
 end
 
 local function breakEgg(egg)
-	-- Without the HP text the egg can't be checked, so log what's inside it and skip it for a while
-	if not findEggHpLabel(egg) then
-		print("[Autofarm] No HP text found on " .. egg.Name .. ", text labels inside it:")
-		for _, descendant in ipairs(egg:GetDescendants()) do
-			if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
-				print("  " .. descendant:GetFullName())
-			end
-		end
-		setStatus("No HP text on " .. egg.Name .. ", skipping for now")
-		state.noHpEggs[egg] = os.clock() + 10
+	if isEggBroken(egg) then
 		return
 	end
 
@@ -719,7 +712,7 @@ local function findNearestSelectedEgg(eggsFolder)
 	local best, bestDistance = nil, math.huge
 	for _, egg in ipairs(eggsFolder:GetChildren()) do
 		local position = getPosition(egg)
-		if state.selectedEggs[egg.Name] and position and (state.noHpEggs[egg] or 0) < os.clock() and not isEggBroken(egg) then
+		if state.selectedEggs[egg.Name] and position and not isEggBroken(egg) then
 			local distance = flatDistance(root.Position, position)
 			if distance < bestDistance then
 				best, bestDistance = egg, distance
@@ -1006,8 +999,7 @@ local Window = Rayfield:CreateWindow({
 	LoadingSubtitle = "Loading...",
 	ConfigurationSaving = {
 		Enabled = true,
-		FolderName = "EggAutofarm",
-		FileName = "Config",
+		FileName = "EggAutofarm",
 	},
 	Discord = { Enabled = false },
 	KeySystem = false,
