@@ -25,6 +25,11 @@ local CONFIG = {
 	StealWaitTime = 1.5,
 	HomeReach = 6,
 	MaxStealAttempts = 5,
+	GemReach = 3,
+	GemTimeout = 12,
+	GemRadius = 250,
+	GemMaxAttempts = 2,
+	GemPickupWait = 0.6,
 }
 
 local PATH_PARAMS = {
@@ -43,27 +48,225 @@ local SUFFIXES = {
 
 -- Zone build folder is workspace.Build.ZoneBuilds[Build]
 -- Egg folder is ReplicatedStorage.Eggs.NormalEggs[EggFolder]
-local ZONES = {
-	{ Name = "Zone 1", EggFolder = "Forest Eggs", Build = "Zone1" },
-	{ Name = "Zone 2", EggFolder = "Desert Eggs", Build = "Zone2" },
-	{ Name = "Zone 3", EggFolder = "Snowy Eggs", Build = "Zone3" },
-	{ Name = "Zone 4", EggFolder = "Candy Eggs", Build = "Zone4" },
-	{ Name = "Zone 5", EggFolder = "Lake Eggs", Build = "Zone5" },
-	{ Name = "Zone 6", EggFolder = "Under Water Eggs", Build = "Zone6" },
-	{ Name = "Zone 7", EggFolder = "Volcano Eggs", Build = "Zone7" },
-	{ Name = "Zone 8", EggFolder = "Blossom Eggs", Build = "Zone8" },
-	{ Name = "Zone 9", EggFolder = "Galaxy Eggs", Build = "Zone9" },
-	{ Name = "Zone 10", EggFolder = "Alien Eggs", Build = "Zone10" },
-	{ Name = "Zone 11", EggFolder = "Zone_11", Build = "Zone11" },
-	{ Name = "Zone 12", EggFolder = "FairyEgg", Build = "Zone12" },
-	{ Name = "Zone 13", EggFolder = "FantasyExpansion", Build = "Zone13" },
+--
+-- Zones are DISCOVERED from workspace.Build at runtime rather than hardcoded,
+-- so a zone added by a game update shows up without editing this script.
+--
+-- The table below is only a hint. The zone-number -> egg-folder mapping is
+-- arbitrary (Zone 1 uses "Forest Eggs", Zone 12 uses "FairyEgg", Zone 13 uses
+-- "FantasyExpansion"), so there is no pattern to derive it from; known pairs
+-- are seeded here and anything new is resolved by resolveEggFolder below.
+local EGG_FOLDER_HINTS = {
+	[1]  = "Forest Eggs",
+	[2]  = "Desert Eggs",
+	[3]  = "Snowy Eggs",
+	[4]  = "Candy Eggs",
+	[5]  = "Lake Eggs",
+	[6]  = "Under Water Eggs",
+	[7]  = "Volcano Eggs",
+	[8]  = "Blossom Eggs",
+	[9]  = "Galaxy Eggs",
+	[10] = "Alien Eggs",
+	[11] = "Zone_11",
+	[12] = "FairyEgg",
+	[13] = "FantasyExpansion",
 }
 
+-- These three are mutated in place, never reassigned: the Rayfield dropdown
+-- holds a reference to zoneNames, so swapping the table would leave the UI
+-- pointing at a stale copy.
+local ZONES = {}
 local zoneNames = {}
 local zoneByName = {}
-for _, zone in ipairs(ZONES) do
-	table.insert(zoneNames, zone.Name)
-	zoneByName[zone.Name] = zone
+
+local function getBuildFolder()
+	return Workspace:FindFirstChild("Build")
+end
+
+local function getNormalEggsFolder()
+	local eggs = ReplicatedStorage:FindFirstChild("Eggs")
+	return eggs and eggs:FindFirstChild("NormalEggs")
+end
+
+-- Zone numbers come from ZoneHitboxes (named "1".."14", and present even while
+-- the zone build itself is streamed out) unioned with ZoneBuilds ("Zone1"...).
+local function discoverZoneNumbers()
+	local seen, numbers = {}, {}
+
+	local build = getBuildFolder()
+	if not build then return numbers end
+
+	local function note(raw)
+		local n = tonumber(raw)
+		if n and not seen[n] then
+			seen[n] = true
+			numbers[#numbers + 1] = n
+		end
+	end
+
+	for _, folderName in ipairs({ "ZoneHitboxes", "ZoneBuilds" }) do
+		local folder = build:FindFirstChild(folderName)
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				note(child.Name:match("%d+"))
+			end
+		end
+	end
+
+	table.sort(numbers)
+	return numbers
+end
+
+-- Identify a zone's egg folder by content rather than by name: the in-world
+-- zone build holds egg instances whose names match the definitions inside
+-- exactly one NormalEggs folder. Works for any future naming scheme, but only
+-- while that zone is streamed in.
+local function matchEggFolderByContents(number, claimed)
+	local build = getBuildFolder()
+	local builds = build and build:FindFirstChild("ZoneBuilds")
+	local zoneBuild = builds and builds:FindFirstChild("Zone" .. number)
+	local worldEggs = zoneBuild and zoneBuild:FindFirstChild("Eggs")
+	local normal = getNormalEggsFolder()
+
+	if not worldEggs or not normal then return nil end
+
+	local present = {}
+	local anyPresent = false
+	for _, egg in ipairs(worldEggs:GetChildren()) do
+		present[egg.Name] = true
+		anyPresent = true
+	end
+	if not anyPresent then return nil end
+
+	local bestName, bestScore = nil, 0
+	for _, folder in ipairs(normal:GetChildren()) do
+		if not claimed[folder.Name] then
+			local score = 0
+			for _, definition in ipairs(folder:GetChildren()) do
+				if present[definition.Name] then score = score + 1 end
+			end
+			if score > bestScore then
+				bestName, bestScore = folder.Name, score
+			end
+		end
+	end
+
+	return bestName
+end
+
+local function resolveEggFolder(number, claimed)
+	local normal = getNormalEggsFolder()
+	if not normal then return nil end
+
+	-- 1. A seeded pair we already know is correct.
+	local hint = EGG_FOLDER_HINTS[number]
+	if hint and not claimed[hint] and normal:FindFirstChild(hint) then
+		return hint
+	end
+
+	-- 2. The folder is sometimes just named after the zone.
+	for _, candidate in ipairs({ "Zone_" .. number, "Zone" .. number, "Zone " .. number }) do
+		if not claimed[candidate] and normal:FindFirstChild(candidate) then
+			return candidate
+		end
+	end
+
+	-- 3. Match on the egg names the zone actually contains.
+	return matchEggFolderByContents(number, claimed)
+end
+
+-- Returns true when the discovered zone list differs from what we had, so
+-- callers know whether the UI needs refreshing.
+local function rebuildZones()
+	local numbers = discoverZoneNumbers()
+
+	-- Build has not replicated yet; keep whatever list we already have.
+	if #numbers == 0 then return false end
+
+	local claimed = {}
+	local fresh = {}
+
+	for _, number in ipairs(numbers) do
+		local entry = {
+			Number = number,
+			Name   = "Zone " .. number,
+			Build  = "Zone" .. number,
+		}
+		local folder = resolveEggFolder(number, claimed)
+		if folder then
+			entry.EggFolder = folder
+			claimed[folder] = true
+		end
+		fresh[#fresh + 1] = entry
+	end
+
+	-- Anything still unmapped gets paired with a leftover folder. For the usual
+	-- shape of an update - one new zone, one new egg folder - this lands the
+	-- correct pairing with no extra information.
+	local normal = getNormalEggsFolder()
+	if normal then
+		local leftovers = {}
+		for _, folder in ipairs(normal:GetChildren()) do
+			if not claimed[folder.Name] then
+				leftovers[#leftovers + 1] = folder.Name
+			end
+		end
+		table.sort(leftovers)
+
+		local nextLeftover = 1
+		for _, entry in ipairs(fresh) do
+			if not entry.EggFolder and leftovers[nextLeftover] then
+				entry.EggFolder = leftovers[nextLeftover]
+				claimed[leftovers[nextLeftover]] = true
+				nextLeftover = nextLeftover + 1
+			end
+		end
+	end
+
+	-- Did anything actually change?
+	local changed = (#fresh ~= #ZONES)
+	if not changed then
+		for i, entry in ipairs(fresh) do
+			local old = ZONES[i]
+			if not old or old.Number ~= entry.Number or old.EggFolder ~= entry.EggFolder then
+				changed = true
+				break
+			end
+		end
+	end
+
+	if not changed then return false end
+
+	-- Mutate in place so the UI's reference stays valid.
+	for i = #ZONES, 1, -1 do ZONES[i] = nil end
+	for i = #zoneNames, 1, -1 do zoneNames[i] = nil end
+	for key in pairs(zoneByName) do zoneByName[key] = nil end
+
+	for i, entry in ipairs(fresh) do
+		ZONES[i] = entry
+		zoneNames[i] = entry.Name
+		zoneByName[entry.Name] = entry
+	end
+
+	return true
+end
+
+rebuildZones()
+
+-- Join can beat replication of workspace.Build, so seed the known zones if
+-- discovery came back empty. A later rescan replaces them.
+if #ZONES == 0 then
+	for number = 1, 13 do
+		local entry = {
+			Number    = number,
+			Name      = "Zone " .. number,
+			Build     = "Zone" .. number,
+			EggFolder = EGG_FOLDER_HINTS[number],
+		}
+		ZONES[number] = entry
+		zoneNames[number] = entry.Name
+		zoneByName[entry.Name] = entry
+	end
 end
 
 local state = {
@@ -75,10 +278,13 @@ local state = {
 	stealAttempts = {},
 	lastEquipPress = 0,
 	lastPath = "none",
+	gems = true,
+	pickaxeName = nil,
 }
 
 local farmToggle
 local eggDropdown
+local zoneDropdown
 local statusLabel
 
 ----------------------------------------------------------------------
@@ -201,8 +407,9 @@ end
 local function getZoneHitbox(zone)
 	local build = Workspace:FindFirstChild("Build")
 	local hitboxes = build and build:FindFirstChild("ZoneHitboxes")
-	local number = zone.Build:match("%d+")
-	return hitboxes and number and hitboxes:FindFirstChild(number)
+	if not hitboxes then return nil end
+	local number = zone.Number or tonumber(zone.Build:match("%d+"))
+	return number and hitboxes:FindFirstChild(tostring(number))
 end
 
 local function getZoneEggsFolder(zone)
@@ -214,7 +421,7 @@ local function getEggNames(zone)
 	local names = {}
 	local eggs = ReplicatedStorage:FindFirstChild("Eggs")
 	local normal = eggs and eggs:FindFirstChild("NormalEggs")
-	local folder = normal and normal:FindFirstChild(zone.EggFolder)
+	local folder = (normal and zone.EggFolder) and normal:FindFirstChild(zone.EggFolder) or nil
 	if folder then
 		for _, egg in ipairs(folder:GetChildren()) do
 			table.insert(names, egg.Name)
@@ -556,33 +763,188 @@ local function stopForSteal()
 end
 
 ----------------------------------------------------------------------
+-- Gem drops
+----------------------------------------------------------------------
+
+-- Breaking an egg can drop gems into workspace.EggGemDrops. They are picked up
+-- by proximity, so collecting one is just walking over it and waiting for the
+-- instance to disappear.
+local function getGemFolder()
+	return Workspace:FindFirstChild("EggGemDrops")
+end
+
+-- Attempts per gem, so one drop that pathfinding cannot reach (inside geometry,
+-- across a gap) cannot stall the farm by being retried forever.
+local gemFailures = {}
+
+local function pruneGemFailures()
+	for gem in pairs(gemFailures) do
+		if not gem.Parent then
+			gemFailures[gem] = nil
+		end
+	end
+end
+
+local function listGems(fromPosition, radius)
+	local folder = getGemFolder()
+	if not folder then return {} end
+
+	pruneGemFailures()
+
+	local gems = {}
+	for _, gem in ipairs(folder:GetChildren()) do
+		if (gemFailures[gem] or 0) < CONFIG.GemMaxAttempts then
+			local position = getPosition(gem)
+			if position then
+				local distance = flatDistance(fromPosition, position)
+				if distance <= radius then
+					gems[#gems + 1] = { gem = gem, distance = distance }
+				end
+			end
+		end
+	end
+
+	table.sort(gems, function(a, b) return a.distance < b.distance end)
+	return gems
+end
+
+-- Give up on gems the moment something worth more needs attention: an animal
+-- waiting to be grabbed, or one already in our hands that needs delivering.
+local function stopForGems()
+	return not state.running or isCarrying() or findTargetAnimalCached() ~= nil
+end
+
+-- Walks over every gem within radius. Returns true if at least one was picked
+-- up, so the caller can loop again rather than going straight back to eggs.
+-- force bypasses the toggle, for the manual "Collect Gems Now" button.
+local function collectGems(radius, force)
+	if not state.gems and not force then return false end
+
+	local _, _, root = getCharacter()
+	if not root then return false end
+
+	local gems = listGems(root.Position, radius or CONFIG.GemRadius)
+	if #gems == 0 then return false end
+
+	local collected = 0
+
+	for index, entry in ipairs(gems) do
+		if stopForGems() then break end
+
+		local gem = entry.gem
+
+		-- Another pass, or simply standing close enough, may already have
+		-- claimed it.
+		if gem.Parent then
+			setStatus(string.format("Collecting gem %d/%d", index, #gems))
+
+			local reached = goTo(gem, CONFIG.GemReach, stopForGems, CONFIG.GemTimeout)
+
+			-- Pickup is not instant, so allow a moment after arriving.
+			if gem.Parent and reached then
+				local deadline = os.clock() + CONFIG.GemPickupWait
+				while gem.Parent and os.clock() < deadline and state.running do
+					task.wait(CONFIG.PollRate)
+				end
+			end
+
+			if not gem.Parent then
+				collected = collected + 1
+				gemFailures[gem] = nil
+			else
+				gemFailures[gem] = (gemFailures[gem] or 0) + 1
+			end
+		else
+			collected = collected + 1
+		end
+	end
+
+	return collected > 0
+end
+
+----------------------------------------------------------------------
 -- Tools and auto swing
 ----------------------------------------------------------------------
 
 -- Presses the 1 key to equip hotbar slot 1 (the pickaxe). Only when nothing is held,
 -- since pressing the same slot again would unequip it.
-local function ensurePickaxe(char, hum)
-	if char:FindFirstChildOfClass("Tool") then
-		return
+-- Slot 1 holds the pickaxe, but after delivering an animal the ANIMAL is the
+-- held Tool: it leaves workspace.CarriedAnimals and goes into the player's
+-- hand. So "is any Tool held?" is not the question - it has to be "is the
+-- PICKAXE held?", or the script keeps swinging the animal and never mines.
+--
+-- The pickaxe's name is learned the first time we equip from empty hands, since
+-- whatever appears then is slot 1 by definition. Until that happens we fall
+-- back to a name heuristic.
+local function isPickaxe(tool)
+	if not tool then
+		return false
 	end
+	if state.pickaxeName then
+		return tool.Name == state.pickaxeName
+	end
+	local name = tool.Name:lower()
+	return name:find("pick") ~= nil or name:find("axe") ~= nil
+end
+
+local function findPickaxeInBackpack()
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	if not backpack then
+		return nil
+	end
+	for _, tool in ipairs(backpack:GetChildren()) do
+		if tool:IsA("Tool") and isPickaxe(tool) then
+			return tool
+		end
+	end
+	return nil
+end
+
+local function ensurePickaxe(char, hum)
+	local heldBefore = char:FindFirstChildOfClass("Tool")
+
+	if isPickaxe(heldBefore) then
+		return true
+	end
+
 	if os.clock() - state.lastEquipPress < 1 then
-		return
+		return false
 	end
 	state.lastEquipPress = os.clock()
 
+	-- Pressing slot 1 while holding a DIFFERENT tool switches to the pickaxe.
+	-- The isPickaxe check above is what keeps us from pressing 1 while already
+	-- holding it, which would unequip instead.
 	local ok = pcall(function()
 		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.One, false, game)
 		task.wait(0.05)
 		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.One, false, game)
 	end)
 
-	if not ok then
-		local backpack = LocalPlayer:FindFirstChild("Backpack")
-		local tool = backpack and backpack:FindFirstChildOfClass("Tool")
-		if tool then
-			hum:EquipTool(tool)
-		end
+	task.wait(0.15)
+	local heldAfter = char:FindFirstChildOfClass("Tool")
+
+	-- Only learn the name on an empty-hands -> tool transition. Learning after
+	-- a failed switch would record the animal's name as the pickaxe.
+	if heldAfter and not heldBefore and not state.pickaxeName then
+		state.pickaxeName = heldAfter.Name
 	end
+
+	if isPickaxe(heldAfter) then
+		return true
+	end
+
+	-- Key press did not take: equip it directly. Deliberately only a tool that
+	-- looks like the pickaxe, never just the first Tool in the backpack, which
+	-- could be the animal we are trying to put away.
+	local tool = findPickaxeInBackpack()
+	if tool and hum then
+		pcall(function() hum:EquipTool(tool) end)
+		task.wait(0.15)
+		return isPickaxe(char:FindFirstChildOfClass("Tool"))
+	end
+
+	return false
 end
 
 -- AutoSwingColorAlpha: 0 = off, 1 = on
@@ -780,6 +1142,10 @@ local function farmZone()
 			break
 		end
 		breakEgg(egg)
+
+		-- Gems land where the egg broke, so sweep the immediate area before
+		-- walking off to the next one.
+		collectGems(CONFIG.GemRadius)
 	end
 
 	if next(state.selectedEggs) == nil then
@@ -801,11 +1167,33 @@ local function deliverAnimal()
 			task.wait(CONFIG.PollRate)
 		end
 
-		local char, hum = getCharacter()
-		if char and not isCarrying() then
-			setStatus("Re-equipping pickaxe")
+		-- The animal ends up in the player's hand rather than back in
+		-- CarriedAnimals, so swapping to slot 1 is what actually puts it away
+		-- and gets the pickaxe back out. One key press can be dropped, so keep
+		-- trying until the pickaxe is genuinely held.
+		setStatus("Re-equipping pickaxe")
+
+		for _ = 1, 8 do
+			if not state.running then
+				break
+			end
+
+			local char, hum = getCharacter()
+			if not char then
+				break
+			end
+
 			state.lastEquipPress = 0
-			ensurePickaxe(char, hum)
+			if ensurePickaxe(char, hum) then
+				break
+			end
+
+			task.wait(0.25)
+		end
+
+		local char = getCharacter()
+		if char and state.running and not isPickaxe(char:FindFirstChildOfClass("Tool")) then
+			setStatus("Could not re-equip pickaxe, retrying next cycle")
 		end
 	end
 
@@ -828,6 +1216,8 @@ local function mainLoop()
 			if target then
 				setStatus("Stealing " .. target.Name)
 				stealAnimal(target)
+			elseif collectGems(CONFIG.GemRadius) then
+				-- Picked something up; re-evaluate before returning to eggs.
 			else
 				setStatus("Farming eggs")
 				farmZone()
@@ -906,6 +1296,20 @@ local function startFarm()
 
 	state.spawnPart = spawnPart
 	state.stealAttempts = {}
+
+	-- Learn slot 1's tool name now, while the player is almost certainly
+	-- holding the pickaxe and not an animal. Without this, isPickaxe falls back
+	-- to a name heuristic, and a pickaxe whose name lacks "pick"/"axe" would be
+	-- misread as the wrong tool - pressing 1 would then unequip it.
+	if not state.pickaxeName and not isCarrying() then
+		local char = getCharacter()
+		local held = char and char:FindFirstChildOfClass("Tool")
+		if held then
+			state.pickaxeName = held.Name
+			print("[Autofarm] Pickaxe identified as:", held.Name)
+		end
+	end
+
 	state.running = true
 	startCameraLock()
 	notify("Autofarm", "Started")
@@ -926,14 +1330,95 @@ local function startFarm()
 	end)
 end
 
+-- Rayfield's Refresh replaces the option list but leaves CurrentOption alone,
+-- so the previous zone's ticks stay on screen even though state.selectedEggs
+-- has been cleared. Clearing the selection explicitly is what actually makes
+-- the dropdown look refreshed.
+local function refreshDropdown(dropdown, options, clearSelection)
+	if not dropdown then return false end
+
+	local ok, err = pcall(function()
+		if type(dropdown.Refresh) == "function" then
+			dropdown:Refresh(options)
+		end
+	end)
+
+	if not ok then
+		warn("[Autofarm] dropdown refresh failed:", err)
+	end
+
+	if clearSelection then
+		-- Separate pcall: a failure here must not hide a successful Refresh.
+		pcall(function() dropdown:Set({}) end)
+	end
+
+	return ok
+end
+
 local function setZone(zone)
+	if not zone then return end
+
 	state.zone = zone
 	state.selectedEggs = {}
-	if eggDropdown then
-		pcall(function()
-			eggDropdown:Refresh(getEggNames(zone))
-		end)
+
+	local names = getEggNames(zone)
+
+	-- With ConfigurationSaving on, Rayfield fires this callback while restoring
+	-- the saved zone, which can happen before the Eggs dropdown exists. Nothing
+	-- to refresh yet; it gets built from state.zone immediately after.
+	if not eggDropdown then return end
+
+	refreshDropdown(eggDropdown, names, true)
+
+	if #names == 0 then
+		setStatus(string.format("%s: no eggs found (%s)", zone.Name,
+			zone.EggFolder
+				and ("folder '" .. zone.EggFolder .. "' is empty or missing")
+				or "egg folder unmapped, try Rescan Zones"))
 	end
+end
+
+-- Re-runs discovery and pushes any newly found zone into the dropdown. Safe to
+-- call repeatedly: rebuildZones reports whether anything actually changed, and
+-- the current selection is carried across by zone number.
+local function refreshZones()
+	if not rebuildZones() then return false end
+
+	local keepNumber = state.zone and state.zone.Number
+	local keep = nil
+	for _, zone in ipairs(ZONES) do
+		if zone.Number == keepNumber then
+			keep = zone
+			break
+		end
+	end
+	local sameZone = keep ~= nil and keep.Number == keepNumber
+	keep = keep or ZONES[1]
+
+	-- Preserve the egg selection across a rebuild of the same zone. Calling
+	-- Set() on the zone dropdown fires its callback, which runs setZone and
+	-- wipes selectedEggs - unwanted when a background rescan merely refreshed
+	-- the list the player is already on.
+	local keptSelection = sameZone and state.selectedEggs or nil
+
+	refreshDropdown(zoneDropdown, zoneNames, false)
+
+	-- Re-point at the rebuilt entry; the old table has been discarded.
+	state.zone = keep
+
+	if zoneDropdown and not sameZone then
+		-- The selected zone genuinely went away, so move the UI to the
+		-- fallback and let the callback reset the egg list.
+		pcall(function() zoneDropdown:Set({ keep.Name }) end)
+	else
+		-- Same zone: refresh the egg options in place and put the selection back.
+		refreshDropdown(eggDropdown, getEggNames(keep), false)
+		if keptSelection then
+			state.selectedEggs = keptSelection
+		end
+	end
+
+	return true
 end
 
 ----------------------------------------------------------------------
@@ -1009,7 +1494,7 @@ local FarmTab = Window:CreateTab("Autofarm", 4483362458)
 
 statusLabel = FarmTab:CreateLabel("Status: Idle")
 
-FarmTab:CreateDropdown({
+zoneDropdown = FarmTab:CreateDropdown({
 	Name = "Zone",
 	Options = zoneNames,
 	CurrentOption = { zoneNames[1] },
@@ -1021,6 +1506,26 @@ FarmTab:CreateDropdown({
 		if zone then
 			setZone(zone)
 		end
+	end,
+})
+
+FarmTab:CreateButton({
+	Name = "Rescan Zones",
+	Callback = function()
+		task.spawn(function()
+			local changed = refreshZones()
+			local parts = {}
+			for _, zone in ipairs(ZONES) do
+				parts[#parts + 1] = string.format("%s -> %s", zone.Name, zone.EggFolder or "unmapped")
+			end
+			print("[Autofarm] Zones:\n  " .. table.concat(parts, "\n  "))
+			Rayfield:Notify({
+				Title = changed and "Zones Updated" or "Zones Unchanged",
+				Content = string.format("%d zone(s) found. Mapping printed to console.", #ZONES),
+				Duration = 6,
+				Image = 4483362458,
+			})
+		end)
 	end,
 })
 
@@ -1080,3 +1585,73 @@ FarmTab:CreateButton({
 	Name = "Print animal values",
 	Callback = printAnimalValues,
 })
+
+FarmTab:CreateToggle({
+	Name = "Auto Collect Gems",
+	CurrentValue = true,
+	Flag = "AutoCollectGems",
+	Callback = function(value)
+		state.gems = value
+	end,
+})
+
+FarmTab:CreateSlider({
+	Name = "Gem Search Radius",
+	Range = { 25, 600 },
+	Increment = 25,
+	Suffix = " studs",
+	CurrentValue = CONFIG.GemRadius,
+	Flag = "GemRadius",
+	Callback = function(value)
+		CONFIG.GemRadius = value
+	end,
+})
+
+FarmTab:CreateButton({
+	Name = "Collect Gems Now",
+	Callback = function()
+		task.spawn(function()
+			local folder = getGemFolder()
+			if not folder then
+				notify("Gems", "workspace.EggGemDrops not found")
+				return
+			end
+
+			local total = #folder:GetChildren()
+			if total == 0 then
+				notify("Gems", "No gems on the ground")
+				return
+			end
+
+			-- The manual button should work with the farm stopped, and
+			-- collectGems needs state.running to drive goTo.
+			local wasRunning = state.running
+			state.running = true
+
+			local picked = collectGems(CONFIG.GemRadius, true)
+
+			state.running = wasRunning
+			notify("Gems", picked and ("Swept " .. total .. " gem(s)") or "Nothing in range")
+		end)
+	end,
+})
+
+----------------------------------------------------------------------
+-- Zone auto-discovery
+----------------------------------------------------------------------
+
+-- workspace.Build can finish replicating after the UI is built, and a zone may
+-- be added by a live update, so rescan on a slow timer. refreshZones is a no-op
+-- unless the discovered list actually differs, which keeps this invisible.
+task.spawn(function()
+	-- Catch late replication quickly, then settle into a slow poll.
+	for _ = 1, 10 do
+		task.wait(2)
+		if refreshZones() then break end
+	end
+
+	while true do
+		task.wait(60)
+		pcall(refreshZones)
+	end
+end)
