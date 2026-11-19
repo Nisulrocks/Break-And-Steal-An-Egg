@@ -362,13 +362,73 @@ local function findChildPath(root, names)
 	return current
 end
 
--- Drops a point onto the ground so pathfinding has a walkable goal (eggs and animals sit above the floor)
-local function groundPoint(position, ignore)
+----------------------------------------------------------------------
+-- Solid-only raycasting
+----------------------------------------------------------------------
+
+-- Only solid geometry should ever block movement. Anything the character walks
+-- through - eggs, animals, gems, decoration - must be invisible to every probe.
+--
+-- RaycastParams.RespectCanCollide does exactly that, but it is a newer
+-- property: on an engine without it the assignment throws and the raycast
+-- quietly goes back to hitting noclip parts. So detect support once, and fall
+-- back to skipping pass-through hits by hand.
+local RESPECTS_CAN_COLLIDE = pcall(function()
+	RaycastParams.new().RespectCanCollide = true
+end)
+
+local PASSTHROUGH_SKIP_LIMIT = 8
+
+-- Returns the first hit the character would actually collide with, or nil.
+local function castSolid(origin, direction, distance, params)
+	if RESPECTS_CAN_COLLIDE then
+		return Workspace:Raycast(origin, direction * distance, params)
+	end
+
+	local from = origin
+	local remaining = distance
+
+	for _ = 1, PASSTHROUGH_SKIP_LIMIT do
+		local result = Workspace:Raycast(from, direction * remaining, params)
+		if not result then
+			return nil
+		end
+
+		local part = result.Instance
+		if not part or part.CanCollide then
+			return result
+		end
+
+		-- Step just past the pass-through surface and keep looking.
+		local travelled = (result.Position - from).Magnitude + 0.1
+		remaining -= travelled
+		if remaining <= 0 then
+			return nil
+		end
+		from = result.Position + direction * 0.1
+	end
+
+	return nil
+end
+
+local function makeRaycastParams(ignore)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = ignore
+	params.IgnoreWater = true
+	if RESPECTS_CAN_COLLIDE then
+		params.RespectCanCollide = true
+	end
+	return params
+end
 
-	local result = Workspace:Raycast(position + Vector3.new(0, 3, 0), Vector3.new(0, -200, 0), params)
+-- Drops a point onto the ground so pathfinding has a walkable goal (eggs and animals sit above the floor)
+local function groundPoint(position, ignore)
+	local params = makeRaycastParams(ignore)
+
+	-- A noclipped egg resting on the floor must not catch this ray, or the goal
+	-- ends up floating above the ground instead of on it.
+	local result = castSolid(position + Vector3.new(0, 3, 0), Vector3.new(0, -1, 0), 200, params)
 	if result then
 		return result.Position
 	end
@@ -571,9 +631,11 @@ end
 -- Obstacle probing
 ----------------------------------------------------------------------
 
--- Pickups are walked over, not around, so they must not read as walls.
+-- Eggs, animals and gems are the things we are trying to walk INTO, and they
+-- are noclipped anyway. Treating them as obstacles made the bot steer around
+-- its own targets, which breaks farming outright.
 -- Rebuilt on a timer rather than per call: this runs inside the steering loop,
--- so three FindFirstChild lookups every frame is pure waste.
+-- so repeating these lookups every frame is pure waste.
 local ignoreCache = { list = nil, char = nil, time = 0 }
 
 local function buildIgnoreList(char)
@@ -582,17 +644,31 @@ local function buildIgnoreList(char)
 	end
 
 	local ignore = { char }
-	for _, name in ipairs({ "EggGemDrops", "CarriedAnimals", "Debris" }) do
+
+	for _, name in ipairs({ "EggGemDrops", "CarriedAnimals", "AnimalPickups", "Debris" }) do
 		local folder = Workspace:FindFirstChild(name)
 		if folder then
 			ignore[#ignore + 1] = folder
 		end
 	end
 
+	-- Only the zone's Eggs folder, never the whole zone build: the build also
+	-- holds the walls and scenery we genuinely do need to path around.
+	local zoneEggs = state.zone and getZoneEggsFolder(state.zone)
+	if zoneEggs then
+		ignore[#ignore + 1] = zoneEggs
+	end
+
 	ignoreCache.list = ignore
 	ignoreCache.char = char
 	ignoreCache.time = os.clock()
 	return ignore
+end
+
+-- Probes share the solid-only params helper defined above, so every obstacle
+-- test agrees on what counts as solid.
+local function makeProbeParams(ignore)
+	return makeRaycastParams(ignore)
 end
 
 -- A single centre ray misses anything the character's shoulders would clip, and
@@ -602,16 +678,14 @@ local BODY_HALF_WIDTH = 1.6
 local PROBE_HEIGHTS = { 1.0, 3.0 }
 
 local function directionBlocked(origin, direction, distance, ignore)
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = ignore
+	local params = makeProbeParams(ignore)
 
 	local side = Vector3.new(-direction.Z, 0, direction.X) * BODY_HALF_WIDTH
 
 	for _, offset in ipairs({ Vector3.zero, side, -side }) do
 		for _, height in ipairs(PROBE_HEIGHTS) do
 			local from = origin + offset + Vector3.new(0, height, 0)
-			if Workspace:Raycast(from, direction * distance, params) then
+			if castSolid(from, direction, distance, params) then
 				return true
 			end
 		end
@@ -726,15 +800,12 @@ local function clearLine(from, to, char)
 	local direction = flat.Unit
 	local distance = flat.Magnitude
 	local side = Vector3.new(-direction.Z, 0, direction.X) * BODY_HALF_WIDTH
-
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = ignore
+	local params = makeProbeParams(ignore)
 
 	for _, offset in ipairs({ Vector3.zero, side, -side }) do
 		for _, height in ipairs(PROBE_HEIGHTS) do
 			local origin = from + offset + Vector3.new(0, height, 0)
-			local result = Workspace:Raycast(origin, direction * distance, params)
+			local result = castSolid(origin, direction, distance, params)
 			-- A hit right at the destination is the target itself, which is fine
 			if result and (result.Position - (to + Vector3.new(0, height, 0))).Magnitude >= 3 then
 				return false
