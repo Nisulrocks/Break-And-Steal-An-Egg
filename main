@@ -10,6 +10,7 @@ local Workspace = game:GetService("Workspace")
 local GuiService = game:GetService("GuiService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -33,10 +34,13 @@ local CONFIG = {
 }
 
 local PATH_PARAMS = {
-	AgentRadius = 2,
+	AgentRadius = 3,
 	AgentHeight = 5,
 	AgentCanJump = true,
-	WaypointSpacing = 12,
+	AgentCanClimb = false,
+	-- 12 was coarse enough that the straight line between two waypoints could
+	-- pass through a wall corner the navmesh had routed around.
+	WaypointSpacing = 4,
 }
 
 local SUFFIXES = {
@@ -280,11 +284,15 @@ local state = {
 	lastPath = "none",
 	gems = true,
 	pickaxeName = nil,
+	minCpsText = nil,
 }
 
 local farmToggle
 local eggDropdown
 local zoneDropdown
+local minCpsInput
+local gemsToggle
+local gemRadiusSlider
 local statusLabel
 
 ----------------------------------------------------------------------
@@ -559,6 +567,92 @@ local function flatUnit(vector, fallback)
 	return flat.Unit
 end
 
+----------------------------------------------------------------------
+-- Obstacle probing
+----------------------------------------------------------------------
+
+-- Pickups are walked over, not around, so they must not read as walls.
+-- Rebuilt on a timer rather than per call: this runs inside the steering loop,
+-- so three FindFirstChild lookups every frame is pure waste.
+local ignoreCache = { list = nil, char = nil, time = 0 }
+
+local function buildIgnoreList(char)
+	if ignoreCache.list and ignoreCache.char == char and os.clock() - ignoreCache.time < 2 then
+		return ignoreCache.list
+	end
+
+	local ignore = { char }
+	for _, name in ipairs({ "EggGemDrops", "CarriedAnimals", "Debris" }) do
+		local folder = Workspace:FindFirstChild(name)
+		if folder then
+			ignore[#ignore + 1] = folder
+		end
+	end
+
+	ignoreCache.list = ignore
+	ignoreCache.char = char
+	ignoreCache.time = os.clock()
+	return ignore
+end
+
+-- A single centre ray misses anything the character's shoulders would clip, and
+-- a knee-height ray walks straight into railings. Probe the body's width at two
+-- heights instead.
+local BODY_HALF_WIDTH = 1.6
+local PROBE_HEIGHTS = { 1.0, 3.0 }
+
+local function directionBlocked(origin, direction, distance, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local side = Vector3.new(-direction.Z, 0, direction.X) * BODY_HALF_WIDTH
+
+	for _, offset in ipairs({ Vector3.zero, side, -side }) do
+		for _, height in ipairs(PROBE_HEIGHTS) do
+			local from = origin + offset + Vector3.new(0, height, 0)
+			if Workspace:Raycast(from, direction * distance, params) then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+-- Sweep outward from dead ahead, alternating sides, so the heading we take is
+-- the smallest deviation from the one we wanted that is actually clear.
+local AVOID_ANGLES = { 0, 18, -18, 36, -36, 55, -55, 75, -75, 95, -95 }
+local AVOID_LOOKAHEAD = 10
+
+-- Returns a clear direction to walk, or nil when every direction is blocked.
+local function clearHeading(root, targetPoint, char)
+	local desired = flatUnit(targetPoint - root.Position, nil)
+	if not desired then
+		return nil
+	end
+
+	local distance = math.min(AVOID_LOOKAHEAD, flatDistance(root.Position, targetPoint))
+	if distance < 2 then
+		return desired
+	end
+
+	local ignore = buildIgnoreList(char)
+
+	for _, angle in ipairs(AVOID_ANGLES) do
+		local direction = CFrame.Angles(0, math.rad(angle), 0) * desired
+		if not directionBlocked(root.Position, direction, distance, ignore) then
+			return direction
+		end
+	end
+
+	return nil
+end
+
+----------------------------------------------------------------------
+-- Steering
+----------------------------------------------------------------------
+
 -- Presses W/A/S/D relative to the camera, the same way the default controls do, so the character heads toward the point
 local function steerToward(point)
 	local _, _, root = getCharacter()
@@ -580,101 +674,251 @@ local function steerToward(point)
 	local alongForward = direction:Dot(forward)
 	local alongRight = direction:Dot(right)
 
-	setKeyHeld("W", alongForward > 0.38)
-	setKeyHeld("S", alongForward < -0.38)
-	setKeyHeld("D", alongRight > 0.38)
-	setKeyHeld("A", alongRight < -0.38)
+	-- A lower threshold than 0.38 keeps diagonals engaged, so the character
+	-- curves around corners instead of alternating between two keys.
+	setKeyHeld("W", alongForward > 0.25)
+	setKeyHeld("S", alongForward < -0.25)
+	setKeyHeld("D", alongRight > 0.25)
+	setKeyHeld("A", alongRight < -0.25)
 end
 
--- True when nothing is in the way between two points, checked at about knee height
+-- Steers at the waypoint, but deviates around anything standing in the way.
+-- Returns false when boxed in on every heading, so the caller can recover.
+--
+-- The heading is re-evaluated on a short timer rather than every frame. Dead
+-- ahead costs six raycasts, but a fully blocked sweep costs sixty-six, and
+-- this runs inside the per-frame steering loop.
+local headingCache = { direction = nil, time = 0, open = true }
+local HEADING_REFRESH = 0.08
+
+local function steerAvoiding(point, char)
+	local _, _, root = getCharacter()
+	if not root then
+		return true
+	end
+
+	if os.clock() - headingCache.time >= HEADING_REFRESH then
+		headingCache.direction = clearHeading(root, point, char)
+		headingCache.open = headingCache.direction ~= nil
+		headingCache.time = os.clock()
+	end
+
+	if not headingCache.direction then
+		steerToward(point)
+		return false
+	end
+
+	-- Aim at a point along the clear heading rather than the waypoint itself.
+	steerToward(root.Position + headingCache.direction * 8)
+	return headingCache.open
+end
+
+-- True when nothing is in the way between two points, checked across the
+-- character's width at knee and chest height
 local function clearLine(from, to, char)
+	local delta = to - from
+	local flat = Vector3.new(delta.X, 0, delta.Z)
+	if flat.Magnitude < 0.01 then
+		return true
+	end
+
+	local ignore = buildIgnoreList(char)
+	local direction = flat.Unit
+	local distance = flat.Magnitude
+	local side = Vector3.new(-direction.Z, 0, direction.X) * BODY_HALF_WIDTH
+
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { char }
+	params.FilterDescendantsInstances = ignore
 
-	local origin = from + Vector3.new(0, 1, 0)
-	local destination = to + Vector3.new(0, 1, 0)
-	local result = Workspace:Raycast(origin, destination - origin, params)
+	for _, offset in ipairs({ Vector3.zero, side, -side }) do
+		for _, height in ipairs(PROBE_HEIGHTS) do
+			local origin = from + offset + Vector3.new(0, height, 0)
+			local result = Workspace:Raycast(origin, direction * distance, params)
+			-- A hit right at the destination is the target itself, which is fine
+			if result and (result.Position - (to + Vector3.new(0, height, 0))).Magnitude >= 3 then
+				return false
+			end
+		end
+	end
 
-	-- A hit right at the destination is the target itself, which is fine
-	return result == nil or (result.Position - destination).Magnitude < 3
+	return true
 end
 
--- Computes a path to the goal and follows it without stopping at every waypoint.
--- The next waypoint is aimed at as soon as the character is close to the current one,
--- so the character keeps a steady walk instead of stop-start movement.
-local function followPath(goal, char, shouldStop, finalReach)
-	local _, hum, root = getCharacter()
-	if not hum then
+----------------------------------------------------------------------
+-- Path following
+----------------------------------------------------------------------
+
+-- Recomputing a path on every goTo iteration is what made movement stutter:
+-- ComputeAsync yields, and the character stood still through it. The route is
+-- cached instead and only rebuilt when it is actually stale, so walking
+-- continues across iterations.
+local pathCache = {
+	waypoints = nil,
+	index = 1,
+	goal = nil,
+	time = 0,
+	blocked = false,
+	connection = nil,
+}
+
+local PATH_MAX_AGE = 3
+local PATH_GOAL_DRIFT = 8
+
+local function clearPathCache()
+	if pathCache.connection then
+		pathCache.connection:Disconnect()
+		pathCache.connection = nil
+	end
+	pathCache.waypoints = nil
+	pathCache.index = 1
+	pathCache.goal = nil
+	pathCache.blocked = false
+end
+
+local function pathCacheUsable(goal)
+	if pathCache.blocked or not pathCache.waypoints then
+		return false
+	end
+	if pathCache.index > #pathCache.waypoints then
+		return false
+	end
+	if os.clock() - pathCache.time > PATH_MAX_AGE then
+		return false
+	end
+	-- A target that has moved far enough needs a new route.
+	return pathCache.goal ~= nil and flatDistance(pathCache.goal, goal) <= PATH_GOAL_DRIFT
+end
+
+local function buildPath(goal, char, root)
+	clearPathCache()
+
+	-- Close with a clear line: walk straight there. This skips the path computation pause.
+	if flatDistance(root.Position, goal) < 15 and clearLine(root.Position, goal, char) then
+		state.lastPath = "Direct"
+		pathCache.waypoints = { { Position = goal, Action = Enum.PathWaypointAction.Walk } }
+		pathCache.index = 1
+		pathCache.goal = goal
+		pathCache.time = os.clock()
 		return
 	end
 
-	-- Close with a clear line: walk straight there. This skips the path computation pause.
-	local direct = flatDistance(root.Position, goal) < 15 and clearLine(root.Position, goal, char)
-
 	local path = PathfindingService:CreatePath(PATH_PARAMS)
-	local ok = false
-	if not direct then
-		ok = pcall(function()
-			path:ComputeAsync(root.Position, goal)
-		end)
-	end
+	local ok = pcall(function()
+		path:ComputeAsync(root.Position, goal)
+	end)
 
-	local waypoints
-	local blocked = false
-	local blockedConnection
+	state.lastPath = ok and path.Status.Name or "ComputeError"
 
-	state.lastPath = direct and "Direct" or (ok and path.Status.Name or "ComputeError")
-
-	if direct then
-		waypoints = { { Position = goal, Action = Enum.PathWaypointAction.Walk } }
-	elseif ok and path.Status == Enum.PathStatus.Success then
-		waypoints = path:GetWaypoints()
-		blockedConnection = path.Blocked:Connect(function()
-			blocked = true
+	if ok and path.Status == Enum.PathStatus.Success then
+		pathCache.waypoints = path:GetWaypoints()
+		pathCache.connection = path.Blocked:Connect(function()
+			pathCache.blocked = true
 		end)
 	else
-		-- No usable path: walk straight toward the goal and let the caller recompute
-		waypoints = { { Position = goal, Action = Enum.PathWaypointAction.Walk } }
+		-- No usable path: head straight at the goal and let avoidance handle it
+		pathCache.waypoints = { { Position = goal, Action = Enum.PathWaypointAction.Walk } }
+	end
+
+	pathCache.index = 1
+	pathCache.goal = goal
+	pathCache.time = os.clock()
+end
+
+-- Follows the cached route, steering around obstacles. Deliberately does NOT
+-- release the movement keys on exit: goTo calls this repeatedly, and releasing
+-- between calls is what produced stop-start walking. goTo releases once, when
+-- the whole journey ends.
+local function followPath(goal, char, shouldStop, finalReach)
+	local _, hum, root = getCharacter()
+	if not hum or not root then
+		return
+	end
+
+	if not pathCacheUsable(goal) then
+		buildPath(goal, char, root)
+	end
+
+	local waypoints = pathCache.waypoints
+	if not waypoints then
+		return
 	end
 
 	local function cancelled()
-		return blocked or shouldStop() or LocalPlayer.Character ~= char or hum.Health <= 0
+		return shouldStop() or LocalPlayer.Character ~= char or hum.Health <= 0
 	end
 
-	-- Hold W/A/S/D like a player would, steering toward each waypoint in turn
 	local reach = math.clamp(hum.WalkSpeed * 0.15, CONFIG.WaypointReach, 16)
-	local index = 1
 	local waypointStart = os.clock()
+	local lastPosition = root.Position
+	local lastProgress = os.clock()
+	local sidestepUntil = 0
 
-	while index <= #waypoints and not cancelled() do
-		local waypoint = waypoints[index]
+	while pathCache.index <= #waypoints and not cancelled() do
+		if pathCache.blocked then
+			-- The route is invalid now, but keep the keys held: the next call
+			-- recomputes while the character is still moving.
+			break
+		end
+
+		local waypoint = waypoints[pathCache.index]
 		-- The final waypoint is the target itself, so it uses the tight reach instead of the route reach
-		local threshold = index == #waypoints and finalReach or reach
+		local threshold = pathCache.index == #waypoints and finalReach or reach
 
 		if flatDistance(root.Position, waypoint.Position) <= threshold then
-			index += 1
+			pathCache.index += 1
 			waypointStart = os.clock()
-			if index <= #waypoints and waypoints[index].Action == Enum.PathWaypointAction.Jump then
+			-- New waypoint means a new direction; do not steer on the old one.
+			headingCache.time = 0
+			if pathCache.index <= #waypoints and waypoints[pathCache.index].Action == Enum.PathWaypointAction.Jump then
 				hum.Jump = true
 			end
 		elseif os.clock() - waypointStart > CONFIG.WaypointTimeout then
+			-- This waypoint is not working out; force a rebuild next call.
+			pathCache.blocked = true
 			break
 		else
-			-- Stuck against something for a moment, so try a jump
+			if os.clock() < sidestepUntil then
+				-- Committed to a sidestep: hold it so we clear the corner
+				-- instead of oscillating back into it.
+				task.wait()
+				continue
+			end
+
+			local open = steerAvoiding(waypoint.Position, char)
+
+			-- Jump at a low obstacle, but only when genuinely stalled.
 			if os.clock() - waypointStart > 0.5 and root.AssemblyLinearVelocity.Magnitude < 1 then
 				hum.Jump = true
 			end
-			steerToward(waypoint.Position)
+
+			if not open then
+				-- Every heading blocked: commit to a sidestep for a moment.
+				local desired = flatUnit(waypoint.Position - root.Position, Vector3.new(0, 0, -1))
+				local side = Vector3.new(-desired.Z, 0, desired.X)
+				if math.random() < 0.5 then
+					side = -side
+				end
+				steerToward(root.Position + side * 12)
+				sidestepUntil = os.clock() + 0.45
+				hum.Jump = true
+			end
+
+			-- Not moving at all for a while means the cached route is wrong.
+			if flatDistance(root.Position, lastPosition) > 1 then
+				lastPosition = root.Position
+				lastProgress = os.clock()
+			elseif os.clock() - lastProgress > 1.5 then
+				pathCache.blocked = true
+				break
+			end
 		end
 
 		task.wait()
 	end
 
-	releaseMoveKeys()
-
-	if blockedConnection then
-		blockedConnection:Disconnect()
+	if pathCache.index > #waypoints then
+		clearPathCache()
 	end
 end
 
@@ -714,15 +958,21 @@ local function goTo(target, reach, shouldStop, timeout)
 	while state.running and not shouldStop() and os.clock() - startTime < timeout do
 		local char, _, root = getCharacter()
 		if not char or not target.Parent then
+			releaseMoveKeys()
+			clearPathCache()
 			return false
 		end
 
 		local position = getPosition(target)
 		if not position then
+			releaseMoveKeys()
+			clearPathCache()
 			return false
 		end
 
 		if flatDistance(root.Position, position) <= reach then
+			releaseMoveKeys()
+			clearPathCache()
 			return true
 		end
 
@@ -730,15 +980,20 @@ local function goTo(target, reach, shouldStop, timeout)
 		followPath(goal, char, shouldStop, reach)
 		checkStalled(char)
 
+
 		-- Give up if the character hasn't actually moved for a while, so the caller can try something else
 		if flatDistance(root.Position, progressPosition) > 1 then
 			progressPosition = root.Position
 			progressTime = os.clock()
 		elseif os.clock() - progressTime > 4 then
+			releaseMoveKeys()
+			clearPathCache()
 			return false
 		end
 	end
 
+	releaseMoveKeys()
+	clearPathCache()
 	return false
 end
 
@@ -1422,6 +1677,200 @@ local function refreshZones()
 end
 
 ----------------------------------------------------------------------
+-- Config saving
+----------------------------------------------------------------------
+
+local CONFIG_FILE = "EggAutofarm_config.json"
+
+local function canUseFiles()
+	return typeof(writefile) == "function"
+		and typeof(readfile) == "function"
+		and typeof(isfile) == "function"
+end
+
+local function collectConfig()
+	local eggs = {}
+	for name in pairs(state.selectedEggs) do
+		eggs[#eggs + 1] = name
+	end
+	table.sort(eggs)
+
+	return {
+		version      = 1,
+		zoneNumber   = state.zone and state.zone.Number or nil,
+		selectedEggs = eggs,
+		minCpsText   = state.minCpsText,
+		minCps       = state.minCps,
+		gems         = state.gems,
+		gemRadius    = CONFIG.GemRadius,
+		pickaxeName  = state.pickaxeName,
+		autofarm     = state.running,
+	}
+end
+
+local function saveConfig()
+	if not canUseFiles() then
+		return false, "executor has no file access"
+	end
+
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(collectConfig())
+	end)
+	if not ok then
+		return false, tostring(encoded)
+	end
+
+	local wrote, err = pcall(function()
+		writefile(CONFIG_FILE, encoded)
+	end)
+	if not wrote then
+		return false, tostring(err)
+	end
+
+	return true
+end
+
+local function loadConfig()
+	if not canUseFiles() then
+		return nil
+	end
+
+	local exists = false
+	pcall(function()
+		exists = isfile(CONFIG_FILE)
+	end)
+	if not exists then
+		return nil
+	end
+
+	local ok, raw = pcall(readfile, CONFIG_FILE)
+	if not ok or type(raw) ~= "string" or raw == "" then
+		return nil
+	end
+
+	local decoded
+	ok, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+
+	return decoded
+end
+
+-- Every control calls queueSave, and applyConfig drives those same controls via
+-- Set(), which fires their callbacks. Without this guard a load would save
+-- itself back halfway through, writing a partially applied config.
+local applyingConfig = false
+local savePending = false
+
+-- Debounced: dragging a slider fires its callback many times a second, and
+-- writing a file on each one is both wasteful and a good way to catch a
+-- half-written file on the next load.
+local function queueSave()
+	if applyingConfig or savePending then
+		return
+	end
+	savePending = true
+
+	task.spawn(function()
+		task.wait(0.5)
+		savePending = false
+		local ok, err = saveConfig()
+		if not ok then
+			warn("[Autofarm] Config autosave failed:", err)
+		end
+	end)
+end
+
+-- Order matters here. Setting the zone clears the egg selection, so the zone
+-- has to be applied first and the eggs restored afterwards. This is exactly
+-- what Rayfield's own restore could not guarantee.
+local function applyConfig(cfg)
+	if type(cfg) ~= "table" then
+		return false
+	end
+
+	applyingConfig = true
+
+	-- 1. Simple scalars.
+	if type(cfg.gemRadius) == "number" then
+		CONFIG.GemRadius = cfg.gemRadius
+		pcall(function() gemRadiusSlider:Set(cfg.gemRadius) end)
+	end
+
+	if type(cfg.gems) == "boolean" then
+		state.gems = cfg.gems
+		pcall(function() gemsToggle:Set(cfg.gems) end)
+	end
+
+	if type(cfg.pickaxeName) == "string" and cfg.pickaxeName ~= "" then
+		state.pickaxeName = cfg.pickaxeName
+	end
+
+	-- 2. Zone, which resets the egg list and selection.
+	if type(cfg.zoneNumber) == "number" then
+		for _, zone in ipairs(ZONES) do
+			if zone.Number == cfg.zoneNumber then
+				setZone(zone)
+				pcall(function() zoneDropdown:Set({ zone.Name }) end)
+				break
+			end
+		end
+	end
+
+	-- 3. Eggs, after the zone has repopulated the options. Only restore eggs
+	-- that still exist in this zone, so a removed egg cannot linger.
+	if type(cfg.selectedEggs) == "table" then
+		local available = {}
+		for _, name in ipairs(getEggNames(state.zone)) do
+			available[name] = true
+		end
+
+		local restored, selected = {}, {}
+		for _, name in ipairs(cfg.selectedEggs) do
+			if available[name] then
+				restored[#restored + 1] = name
+				selected[name] = true
+			end
+		end
+
+		if #restored > 0 then
+			state.selectedEggs = selected
+			pcall(function() eggDropdown:Set(restored) end)
+		end
+	end
+
+	-- 4. Threshold. Re-parse the text so the saved number and its display
+	-- cannot drift apart.
+	if type(cfg.minCpsText) == "string" and cfg.minCpsText ~= "" then
+		local value = parseMoney(cfg.minCpsText)
+		if value then
+			state.minCps = value
+			state.minCpsText = cfg.minCpsText
+			pcall(function() minCpsInput:Set(cfg.minCpsText) end)
+		end
+	elseif type(cfg.minCps) == "number" then
+		state.minCps = cfg.minCps
+	end
+
+	applyingConfig = false
+
+	-- 5. Autofarm last, so it only ever starts once the zone, eggs and
+	-- threshold it depends on are already in place. Spawned rather than called
+	-- inline because startFarm waits up to 30s for the base to load, which
+	-- would otherwise block whoever asked for the config to be applied.
+	if cfg.autofarm == true and not state.running then
+		task.spawn(function()
+			pcall(function() farmToggle:Set(true) end)
+		end)
+	end
+
+	return true
+end
+
+----------------------------------------------------------------------
 -- Rayfield UI
 ----------------------------------------------------------------------
 
@@ -1482,10 +1931,11 @@ local Window = Rayfield:CreateWindow({
 	Name = "Egg Autofarm",
 	LoadingTitle = "Egg Autofarm",
 	LoadingSubtitle = "Loading...",
-	ConfigurationSaving = {
-		Enabled = true,
-		FileName = "EggAutofarm",
-	},
+	-- Rayfield's own saving is off on purpose: restoring the zone clears the
+	-- egg selection, and its restore order is dictionary order, so eggs could
+	-- be applied before the zone and then wiped. The config below is applied
+	-- in a controlled order instead.
+	ConfigurationSaving = { Enabled = false },
 	Discord = { Enabled = false },
 	KeySystem = false,
 })
@@ -1505,6 +1955,7 @@ zoneDropdown = FarmTab:CreateDropdown({
 		local zone = zoneByName[name]
 		if zone then
 			setZone(zone)
+			queueSave()
 		end
 	end,
 })
@@ -1543,10 +1994,11 @@ eggDropdown = FarmTab:CreateDropdown({
 			end
 		end
 		state.selectedEggs = selected
+		queueSave()
 	end,
 })
 
-FarmTab:CreateInput({
+minCpsInput = FarmTab:CreateInput({
 	Name = "Min Cash/s",
 	PlaceholderText = "e.g. 20T",
 	RemoveTextAfterFocusLost = false,
@@ -1555,6 +2007,8 @@ FarmTab:CreateInput({
 		local value = parseMoney(text)
 		if value then
 			state.minCps = value
+			state.minCpsText = text
+			queueSave()
 			print("[Autofarm] Threshold set to", value, "from input", text)
 			notify("Threshold", "Stealing animals above " .. text)
 		else
@@ -1573,6 +2027,7 @@ farmToggle = FarmTab:CreateToggle({
 		else
 			stopFarm()
 		end
+		queueSave()
 	end,
 })
 
@@ -1586,16 +2041,17 @@ FarmTab:CreateButton({
 	Callback = printAnimalValues,
 })
 
-FarmTab:CreateToggle({
+gemsToggle = FarmTab:CreateToggle({
 	Name = "Auto Collect Gems",
 	CurrentValue = true,
 	Flag = "AutoCollectGems",
 	Callback = function(value)
 		state.gems = value
+		queueSave()
 	end,
 })
 
-FarmTab:CreateSlider({
+gemRadiusSlider = FarmTab:CreateSlider({
 	Name = "Gem Search Radius",
 	Range = { 25, 600 },
 	Increment = 25,
@@ -1604,6 +2060,7 @@ FarmTab:CreateSlider({
 	Flag = "GemRadius",
 	Callback = function(value)
 		CONFIG.GemRadius = value
+		queueSave()
 	end,
 })
 
@@ -1635,6 +2092,71 @@ FarmTab:CreateButton({
 		end)
 	end,
 })
+
+FarmTab:CreateButton({
+	Name = "Save Config",
+	Callback = function()
+		local ok, err = saveConfig()
+		if ok then
+			local eggCount = 0
+			for _ in pairs(state.selectedEggs) do
+				eggCount = eggCount + 1
+			end
+			notify("Config Saved", string.format("%s, %d egg(s), threshold %s",
+				state.zone and state.zone.Name or "no zone",
+				eggCount,
+				state.minCpsText or tostring(state.minCps)))
+		else
+			notify("Config", "Save failed: " .. tostring(err))
+		end
+	end,
+})
+
+FarmTab:CreateButton({
+	Name = "Load Config",
+	Callback = function()
+		local cfg = loadConfig()
+		if cfg and applyConfig(cfg) then
+			notify("Config", "Loaded saved settings")
+		else
+			notify("Config", "No saved config found")
+		end
+	end,
+})
+
+----------------------------------------------------------------------
+-- Startup
+----------------------------------------------------------------------
+
+-- Auto-load on execute. Runs after every control exists, so applyConfig can
+-- drive the UI as well as the state.
+task.spawn(function()
+	local cfg = loadConfig()
+	if not cfg then
+		return
+	end
+
+	-- Zone discovery can still be waiting on workspace.Build, and a config
+	-- naming a zone we have not found yet would silently not apply.
+	for _ = 1, 10 do
+		local found = false
+		for _, zone in ipairs(ZONES) do
+			if zone.Number == cfg.zoneNumber then
+				found = true
+				break
+			end
+		end
+		if found or cfg.zoneNumber == nil then
+			break
+		end
+		task.wait(1)
+	end
+
+	if applyConfig(cfg) then
+		print("[Autofarm] Config loaded from " .. CONFIG_FILE)
+		setStatus("Config loaded")
+	end
+end)
 
 ----------------------------------------------------------------------
 -- Zone auto-discovery
