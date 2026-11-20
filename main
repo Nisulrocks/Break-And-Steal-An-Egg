@@ -11,6 +11,9 @@ local GuiService = game:GetService("GuiService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = game:GetService("VirtualUser")
+local Lighting = game:GetService("Lighting")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -20,6 +23,12 @@ local CONFIG = {
 	WaypointReach = 4,
 	PathGoalTimeout = 40,
 	EggReach = 1.5,
+	-- Once in range we stay put until drifting past this, rather than
+	-- re-approaching the instant we are a hair outside EggReach.
+	EggStayRadius = 6,
+	-- Give up on an egg whose HP has not moved for this long: it is not being
+	-- damaged, so standing there achieves nothing.
+	EggStallTimeout = 4,
 	EggTimeout = 120,
 	ZoneReach = 25,
 	StealReach = 5,
@@ -285,7 +294,44 @@ local state = {
 	gems = true,
 	pickaxeName = nil,
 	minCpsText = nil,
+	action = "Idle",
+	rotateZones = false,
+	antiAfk = true,
+	webhookUrl = nil,
+	webhookEnabled = false,
+	webhookMinValue = 0,
 }
+
+-- Session counters, plus lifetime totals carried across runs in the config.
+local stats = {
+	startTime      = os.clock(),
+	eggsBroken     = 0,
+	animalsStolen  = 0,
+	delivered      = 0,
+	gemsCollected  = 0,
+	valueStolen    = 0,
+	bestName       = nil,
+	bestValue      = 0,
+	zonesFarmed    = {},
+}
+
+local lifetime = {
+	eggsBroken    = 0,
+	animalsStolen = 0,
+	delivered     = 0,
+	gemsCollected = 0,
+	runtime       = 0,
+	bestName      = nil,
+	bestValue     = 0,
+}
+
+-- These are defined further down but called before that point, so they are
+-- declared here. Without the declaration the earlier call would resolve to a
+-- nil global rather than the local.
+local onAnimalStolen = function() end
+local setZone
+local sendSessionReport
+local setAntiAfk
 
 local farmToggle
 local eggDropdown
@@ -304,6 +350,7 @@ local function notify(title, content)
 end
 
 local function setStatus(text)
+	state.action = text
 	if statusLabel then
 		pcall(function()
 			statusLabel:Set("Status: " .. text)
@@ -697,7 +744,7 @@ end
 -- Sweep outward from dead ahead, alternating sides, so the heading we take is
 -- the smallest deviation from the one we wanted that is actually clear.
 local AVOID_ANGLES = { 0, 18, -18, 36, -36, 55, -55, 75, -75, 95, -95 }
-local AVOID_LOOKAHEAD = 10
+local AVOID_LOOKAHEAD = 10 -- adjustable from the Movement tab
 
 -- Returns a clear direction to walk, or nil when every direction is blocked.
 local function clearHeading(root, targetPoint, char)
@@ -782,8 +829,14 @@ local function steerAvoiding(point, char)
 		return false
 	end
 
-	-- Aim at a point along the clear heading rather than the waypoint itself.
-	steerToward(root.Position + headingCache.direction * 8)
+	-- Aim along the clear heading, but never PAST the thing we are walking to.
+	-- A fixed 8-stud projection overshoots a target 2 studs away, so the
+	-- character walks past it, turns, overshoots again: the left-right jitter
+	-- seen when settling onto an egg.
+	local distance = flatDistance(root.Position, point)
+	local lookAhead = math.clamp(distance, 1, 8)
+
+	steerToward(root.Position + headingCache.direction * lookAhead)
 	return headingCache.open
 end
 
@@ -834,7 +887,10 @@ local pathCache = {
 }
 
 local PATH_MAX_AGE = 3
-local PATH_GOAL_DRIFT = 8
+-- Eggs in a zone sit close together. At 8 studs the route to the egg we just
+-- broke was being reused for the next one, leaving the character standing on a
+-- finished path making no progress until the stall timers fired.
+local PATH_GOAL_DRIFT = 3
 
 local function clearPathCache()
 	if pathCache.connection then
@@ -917,6 +973,14 @@ local function followPath(goal, char, shouldStop, finalReach)
 
 	local function cancelled()
 		return shouldStop() or LocalPlayer.Character ~= char or hum.Health <= 0
+	end
+
+	-- Already at the destination: retire the route instead of walking out the
+	-- remaining waypoints, which would otherwise idle until a timeout.
+	local finalWaypoint = waypoints[#waypoints]
+	if finalWaypoint and flatDistance(root.Position, finalWaypoint.Position) <= finalReach then
+		clearPathCache()
+		return
 	end
 
 	local reach = math.clamp(hum.WalkSpeed * 0.15, CONFIG.WaypointReach, 16)
@@ -1176,6 +1240,8 @@ local function collectGems(radius, force)
 
 			if not gem.Parent then
 				collected = collected + 1
+				stats.gemsCollected += 1
+				lifetime.gemsCollected += 1
 				gemFailures[gem] = nil
 			else
 				gemFailures[gem] = (gemFailures[gem] or 0) + 1
@@ -1352,6 +1418,20 @@ local function stealAnimal(animal)
 	end
 
 	if isCarrying() then
+		local value = readCashPerSecond(animal) or 0
+
+		stats.animalsStolen += 1
+		stats.valueStolen += value
+		lifetime.animalsStolen += 1
+
+		if value > stats.bestValue then
+			stats.bestName, stats.bestValue = animal.Name, value
+		end
+		if value > lifetime.bestValue then
+			lifetime.bestName, lifetime.bestValue = animal.Name, value
+		end
+
+		onAnimalStolen(animal.Name, value)
 		notify("Steal", "Picked up " .. animal.Name)
 	else
 		state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
@@ -1365,29 +1445,112 @@ local function breakEgg(egg)
 
 	local startTime = os.clock()
 
+	-- Auto swing damages whatever is in front of us, so once we are on the egg
+	-- the right thing to do is stand still. Chasing its exact centre is what
+	-- produced the left-right jitter.
+	local inPosition = false
+	local lastHp = getEggHpText(egg)
+	local lastHpChange = os.clock()
+	local stallRecoveries = 0
+
 	while state.running and egg.Parent and not isEggBroken(egg) do
 		if stopForSteal() or os.clock() - startTime > CONFIG.EggTimeout then
-			return
+			break
 		end
 
 		local char, hum, root = getCharacter()
 		if not char then
-			return
+			break
 		end
 
 		ensurePickaxe(char, hum)
 
 		local eggPosition = getPosition(egg)
 		if not eggPosition then
-			return
+			break
 		end
 
-		if flatDistance(root.Position, eggPosition) > CONFIG.EggReach then
+		local distance = flatDistance(root.Position, eggPosition)
+		-- Wider radius to stay than to arrive, so small drift does not trigger
+		-- a fresh approach every few frames.
+		local threshold = inPosition and CONFIG.EggStayRadius or CONFIG.EggReach
+
+		if distance > threshold then
+			inPosition = false
 			goTo(egg, CONFIG.EggReach, stopForSteal, CONFIG.PathGoalTimeout)
 		else
+			if not inPosition then
+				inPosition = true
+				-- Stop walking and drop the route; we are here and swinging.
+				releaseMoveKeys()
+				clearPathCache()
+			end
+
+			local hp = getEggHpText(egg)
+			if hp ~= lastHp then
+				lastHp = hp
+				lastHpChange = os.clock()
+				stallRecoveries = 0
+			elseif os.clock() - lastHpChange > CONFIG.EggStallTimeout then
+				if stallRecoveries < 1 then
+					-- Possibly just outside swing range after drifting to the
+					-- edge of the stay radius. Close in once before writing
+					-- the egg off, so a nearly-broken one is not abandoned.
+					stallRecoveries += 1
+					lastHpChange = os.clock()
+					inPosition = false
+				else
+					-- Still nothing happening. Move on rather than waiting out
+					-- EggTimeout.
+					break
+				end
+			end
+
 			task.wait(CONFIG.PollRate)
 		end
 	end
+
+	if isEggBroken(egg) then
+		stats.eggsBroken += 1
+		lifetime.eggsBroken += 1
+	end
+
+	-- Never leave a finished route behind: the next egg is usually close by,
+	-- and a stale path to this one would be reused for it.
+	releaseMoveKeys()
+	clearPathCache()
+end
+
+-- Moves to the next zone that has at least one of our selected eggs defined.
+-- Wraps around, and gives up after a full lap so a selection that matches
+-- nothing anywhere cannot spin the farm through every zone forever.
+local function advanceZone()
+	if #ZONES < 2 then
+		return false
+	end
+
+	local currentIndex = 1
+	for index, zone in ipairs(ZONES) do
+		if zone.Number == (state.zone and state.zone.Number) then
+			currentIndex = index
+			break
+		end
+	end
+
+	for step = 1, #ZONES - 1 do
+		local candidate = ZONES[((currentIndex - 1 + step) % #ZONES) + 1]
+
+		for _, name in ipairs(getEggNames(candidate)) do
+			if state.selectedEggs[name] then
+				setStatus("Rotating to " .. candidate.Name)
+				setZone(candidate)
+				pcall(function() zoneDropdown:Set({ candidate.Name }) end)
+				return true
+			end
+		end
+	end
+
+	return false
 end
 
 -- Closest selected egg that isn't broken yet, measured from the player
@@ -1476,6 +1639,14 @@ local function farmZone()
 
 	if next(state.selectedEggs) == nil then
 		task.wait(1)
+		return
+	end
+
+	-- Nothing selected left unbroken here. With rotation on, move to the next
+	-- zone that still has one of our selected eggs standing, so the farm keeps
+	-- working instead of idling on a cleared zone waiting for respawns.
+	if state.rotateZones and not findNearestSelectedEgg(eggsFolder) then
+		advanceZone()
 	end
 end
 
@@ -1492,6 +1663,9 @@ local function deliverAnimal()
 		while state.running and isCarrying() and os.clock() - startTime < 5 do
 			task.wait(CONFIG.PollRate)
 		end
+
+		stats.delivered += 1
+		lifetime.delivered += 1
 
 		-- The animal ends up in the player's hand rather than back in
 		-- CarriedAnimals, so swapping to slot 1 is what actually puts it away
@@ -1594,6 +1768,10 @@ local function stopFarm()
 	stopCameraLock()
 	setAutoSwing(false)
 	notify("Autofarm", "Stopped")
+
+	if state.webhookEnabled then
+		sendSessionReport("Farm stopped")
+	end
 end
 
 local function startFarm()
@@ -1623,6 +1801,12 @@ local function startFarm()
 	state.spawnPart = spawnPart
 	state.stealAttempts = {}
 
+	-- Anti-AFK defaults on, so arm it here rather than relying on a config
+	-- load to turn it on.
+	if state.antiAfk then
+		setAntiAfk(true)
+	end
+
 	-- Learn slot 1's tool name now, while the player is almost certainly
 	-- holding the pickaxe and not an animal. Without this, isPickaxe falls back
 	-- to a name heuristic, and a pickaxe whose name lacks "pick"/"axe" would be
@@ -1639,6 +1823,10 @@ local function startFarm()
 	state.running = true
 	startCameraLock()
 	notify("Autofarm", "Started")
+
+	if state.webhookEnabled then
+		sendSessionReport("Farm started")
+	end
 
 	task.spawn(function()
 		local ok, err = pcall(function()
@@ -1681,7 +1869,7 @@ local function refreshDropdown(dropdown, options, clearSelection)
 	return ok
 end
 
-local function setZone(zone)
+function setZone(zone)
 	if not zone then return end
 
 	state.zone = zone
@@ -1776,6 +1964,23 @@ local function collectConfig()
 		gemRadius    = CONFIG.GemRadius,
 		pickaxeName  = state.pickaxeName,
 		autofarm     = state.running,
+		rotateZones  = state.rotateZones,
+		antiAfk      = state.antiAfk,
+		webhookUrl   = state.webhookUrl,
+		webhookOn    = state.webhookEnabled,
+		webhookMin   = state.webhookMinValue,
+		-- These counters are incremented live next to the session ones, so
+		-- they already include this run. Only runtime needs the session added,
+		-- because nothing advances it during play.
+		lifetime     = {
+			eggsBroken    = lifetime.eggsBroken,
+			animalsStolen = lifetime.animalsStolen,
+			delivered     = lifetime.delivered,
+			gemsCollected = lifetime.gemsCollected,
+			runtime       = lifetime.runtime + (os.clock() - stats.startTime),
+			bestName      = lifetime.bestName,
+			bestValue     = lifetime.bestValue,
+		},
 	}
 end
 
@@ -1880,6 +2085,38 @@ local function applyConfig(cfg)
 		state.pickaxeName = cfg.pickaxeName
 	end
 
+	if type(cfg.rotateZones) == "boolean" then
+		state.rotateZones = cfg.rotateZones
+	end
+
+	if type(cfg.antiAfk) == "boolean" then
+		state.antiAfk = cfg.antiAfk
+		setAntiAfk(cfg.antiAfk)
+	end
+
+	if type(cfg.webhookUrl) == "string" and cfg.webhookUrl ~= "" then
+		state.webhookUrl = cfg.webhookUrl
+	end
+	if type(cfg.webhookOn) == "boolean" then
+		state.webhookEnabled = cfg.webhookOn and state.webhookUrl ~= nil
+	end
+	if type(cfg.webhookMin) == "number" then
+		state.webhookMinValue = cfg.webhookMin
+	end
+
+	-- Lifetime totals are cumulative, so they are loaded rather than merged:
+	-- collectConfig already folds the current session in when saving.
+	if type(cfg.lifetime) == "table" then
+		for _, key in ipairs({ "eggsBroken", "animalsStolen", "delivered", "gemsCollected", "runtime", "bestValue" }) do
+			if type(cfg.lifetime[key]) == "number" then
+				lifetime[key] = cfg.lifetime[key]
+			end
+		end
+		if type(cfg.lifetime.bestName) == "string" then
+			lifetime.bestName = cfg.lifetime.bestName
+		end
+	end
+
 	-- 2. Zone, which resets the egg list and selection.
 	if type(cfg.zoneNumber) == "number" then
 		for _, zone in ipairs(ZONES) do
@@ -1942,6 +2179,358 @@ local function applyConfig(cfg)
 end
 
 ----------------------------------------------------------------------
+-- Formatting
+----------------------------------------------------------------------
+
+-- Reverse of parseMoney: 11100000000 -> "11.1B". Built from the same SUFFIXES
+-- table, so it always speaks the game's own units.
+local SUFFIX_ORDER = {
+	{ 1e45, "Qd" }, { 1e42, "Td" }, { 1e39, "Dd" }, { 1e36, "Ud" },
+	{ 1e33, "Dc" }, { 1e30, "No" }, { 1e27, "Oc" }, { 1e24, "Sp" },
+	{ 1e21, "Sx" }, { 1e18, "Qi" }, { 1e15, "Qa" },
+	{ 1e12, "T" },  { 1e9,  "B" },  { 1e6,  "M" }, { 1e3, "K" },
+}
+
+local function formatMoney(value)
+	value = tonumber(value) or 0
+	for _, entry in ipairs(SUFFIX_ORDER) do
+		if value >= entry[1] then
+			return string.format("%.2f%s", value / entry[1], entry[2])
+		end
+	end
+	return string.format("%d", value)
+end
+
+local function formatDuration(seconds)
+	seconds = math.max(0, math.floor(seconds))
+	local hours = math.floor(seconds / 3600)
+	local minutes = math.floor((seconds % 3600) / 60)
+	return string.format("%02d:%02d:%02d", hours, minutes, seconds % 60)
+end
+
+local function sessionSeconds()
+	return os.clock() - stats.startTime
+end
+
+-- Events per hour, guarded against the first few seconds where the elapsed
+-- time is tiny and the rate would read as absurd.
+local function perHour(count)
+	local elapsed = sessionSeconds()
+	if elapsed < 30 then
+		return 0
+	end
+	return count / (elapsed / 3600)
+end
+
+----------------------------------------------------------------------
+-- Discord webhook
+----------------------------------------------------------------------
+
+-- Executors expose the HTTP function under several names.
+local httpRequest = (syn and syn.request)
+	or (http and http.request)
+	or http_request
+	or request
+
+local WEBHOOK_MIN_GAP = 3
+local webhookQueue = {}
+local webhookBusy = false
+
+local function webhookAvailable()
+	return typeof(httpRequest) == "function"
+end
+
+local function postWebhook(payload)
+	if not webhookAvailable() then
+		return false, "executor has no HTTP request function"
+	end
+
+	local url = state.webhookUrl
+	if type(url) ~= "string" or not url:match("^https://discord%.com/api/webhooks/") then
+		return false, "webhook URL is not a Discord webhook"
+	end
+
+	local ok, body = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not ok then
+		return false, "could not encode payload"
+	end
+
+	local sent, response = pcall(function()
+		return httpRequest({
+			Url = url,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = body,
+		})
+	end)
+
+	if not sent then
+		return false, tostring(response)
+	end
+
+	local code = type(response) == "table" and (response.StatusCode or response.Status) or nil
+	if type(code) == "number" and code >= 400 then
+		return false, "Discord returned " .. tostring(code)
+	end
+
+	return true
+end
+
+-- Discord rate-limits hard, and a good farm can steal several animals a
+-- second. Queue and drain on a timer rather than posting inline.
+local function queueWebhook(payload)
+	if not state.webhookEnabled then
+		return
+	end
+
+	webhookQueue[#webhookQueue + 1] = payload
+
+	if webhookBusy then
+		return
+	end
+	webhookBusy = true
+
+	task.spawn(function()
+		while #webhookQueue > 0 do
+			local next = table.remove(webhookQueue, 1)
+			local ok, err = postWebhook(next)
+			if not ok then
+				warn("[Autofarm] Webhook failed:", err)
+			end
+			task.wait(WEBHOOK_MIN_GAP)
+		end
+		webhookBusy = false
+	end)
+end
+
+local function baseEmbed(title, colour, fields)
+	return {
+		username = "Egg Autofarm",
+		embeds = { {
+			title = title,
+			color = colour,
+			fields = fields,
+			footer = { text = string.format("%s  |  %s", LocalPlayer.Name, formatDuration(sessionSeconds())) },
+		} },
+	}
+end
+
+-- Assigned to the forward declaration made before stealAnimal.
+function onAnimalStolen(name, value)
+	if not state.webhookEnabled then
+		return
+	end
+	if value < (state.webhookMinValue or 0) then
+		return
+	end
+
+	queueWebhook(baseEmbed("Rare animal secured", 3066993, {
+		{ name = "Animal", value = tostring(name), inline = true },
+		{ name = "Cash/s", value = formatMoney(value), inline = true },
+		{ name = "Zone", value = state.zone and state.zone.Name or "unknown", inline = true },
+	}))
+end
+
+function sendSessionReport(title)
+	queueWebhook(baseEmbed(title, 5793266, {
+		{ name = "Runtime", value = formatDuration(sessionSeconds()), inline = true },
+		{ name = "Eggs broken", value = tostring(stats.eggsBroken), inline = true },
+		{ name = "Animals stolen", value = tostring(stats.animalsStolen), inline = true },
+		{ name = "Delivered", value = tostring(stats.delivered), inline = true },
+		{ name = "Gems", value = tostring(stats.gemsCollected), inline = true },
+		{ name = "Best animal", value = stats.bestName
+			and string.format("%s (%s)", stats.bestName, formatMoney(stats.bestValue))
+			or "none", inline = false },
+	}))
+end
+
+----------------------------------------------------------------------
+-- Anti-AFK
+----------------------------------------------------------------------
+
+-- Roblox disconnects an idle client after ~20 minutes. Nudging the virtual
+-- controller on the Idled signal resets that timer without moving the player.
+local afkConnection
+
+function setAntiAfk(enabled)
+	state.antiAfk = enabled
+
+	if afkConnection then
+		afkConnection:Disconnect()
+		afkConnection = nil
+	end
+
+	if not enabled then
+		return
+	end
+
+	afkConnection = LocalPlayer.Idled:Connect(function()
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end)
+end
+
+----------------------------------------------------------------------
+-- Performance mode
+----------------------------------------------------------------------
+
+-- Everything here is reversible: originals are captured on the way in so the
+-- toggle can put the game back exactly as it was.
+local perfOriginals = nil
+
+local function setPerformanceMode(enabled)
+	if enabled then
+		if perfOriginals then
+			return
+		end
+
+		perfOriginals = {
+			quality = nil,
+			globalShadows = Lighting.GlobalShadows,
+			fogEnd = Lighting.FogEnd,
+			effects = {},
+			terrainDecoration = nil,
+			terrainWater = {},
+		}
+
+		pcall(function()
+			perfOriginals.quality = settings().Rendering.QualityLevel
+			settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+		end)
+
+		pcall(function()
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 9e9
+		end)
+
+		for _, effect in ipairs(Lighting:GetChildren()) do
+			if effect:IsA("PostEffect") then
+				perfOriginals.effects[effect] = effect.Enabled
+				effect.Enabled = false
+			end
+		end
+
+		local terrain = Workspace:FindFirstChildOfClass("Terrain")
+		if terrain then
+			pcall(function()
+				perfOriginals.terrainDecoration = terrain.Decoration
+				terrain.Decoration = false
+				perfOriginals.terrainWater = {
+					reflectance = terrain.WaterReflectance,
+					transparency = terrain.WaterTransparency,
+					wavesize = terrain.WaterWaveSize,
+					wavespeed = terrain.WaterWaveSpeed,
+				}
+				terrain.WaterReflectance = 0
+				terrain.WaterTransparency = 0
+				terrain.WaterWaveSize = 0
+				terrain.WaterWaveSpeed = 0
+			end)
+		end
+
+		return
+	end
+
+	if not perfOriginals then
+		return
+	end
+
+	pcall(function()
+		if perfOriginals.quality then
+			settings().Rendering.QualityLevel = perfOriginals.quality
+		end
+		Lighting.GlobalShadows = perfOriginals.globalShadows
+		Lighting.FogEnd = perfOriginals.fogEnd
+	end)
+
+	for effect, wasEnabled in pairs(perfOriginals.effects) do
+		pcall(function()
+			effect.Enabled = wasEnabled
+		end)
+	end
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain and perfOriginals.terrainDecoration ~= nil then
+		pcall(function()
+			terrain.Decoration = perfOriginals.terrainDecoration
+			terrain.WaterReflectance = perfOriginals.terrainWater.reflectance
+			terrain.WaterTransparency = perfOriginals.terrainWater.transparency
+			terrain.WaterWaveSize = perfOriginals.terrainWater.wavesize
+			terrain.WaterWaveSpeed = perfOriginals.terrainWater.wavespeed
+		end)
+	end
+
+	perfOriginals = nil
+end
+
+----------------------------------------------------------------------
+-- Server tools
+----------------------------------------------------------------------
+
+local function rejoinServer()
+	local ok, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+	end)
+	if not ok then
+		notify("Rejoin", "Failed: " .. tostring(err))
+	end
+end
+
+-- Picks a different public server with room in it. Falls back to a plain
+-- Teleport, which lands us in some server rather than none.
+local function serverHop()
+	notify("Server Hop", "Looking for another server")
+
+	local url = string.format(
+		"https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100",
+		game.PlaceId)
+
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+
+	if ok then
+		local decoded
+		ok, decoded = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+
+		if ok and type(decoded) == "table" and type(decoded.data) == "table" then
+			local candidates = {}
+			for _, server in ipairs(decoded.data) do
+				if type(server.id) == "string"
+					and server.id ~= game.JobId
+					and type(server.playing) == "number"
+					and type(server.maxPlayers) == "number"
+					and server.playing < server.maxPlayers then
+					candidates[#candidates + 1] = server.id
+				end
+			end
+
+			if #candidates > 0 then
+				local pick = candidates[math.random(1, #candidates)]
+				local sent = pcall(function()
+					TeleportService:TeleportToPlaceInstance(game.PlaceId, pick, LocalPlayer)
+				end)
+				if sent then
+					return true
+				end
+			end
+		end
+	end
+
+	notify("Server Hop", "No listed server available, teleporting to any")
+	pcall(function()
+		TeleportService:Teleport(game.PlaceId, LocalPlayer)
+	end)
+	return false
+end
+
+----------------------------------------------------------------------
 -- Rayfield UI
 ----------------------------------------------------------------------
 
@@ -1999,21 +2588,81 @@ local function printSpeedInfo()
 end
 
 local Window = Rayfield:CreateWindow({
-	Name = "Egg Autofarm",
-	LoadingTitle = "Egg Autofarm",
-	LoadingSubtitle = "Loading...",
-	-- Rayfield's own saving is off on purpose: restoring the zone clears the
-	-- egg selection, and its restore order is dictionary order, so eggs could
-	-- be applied before the zone and then wiped. The config below is applied
-	-- in a controlled order instead.
+	Name = "Break & Steal an Egg",
+	Icon = "egg",
+	LoadingTitle = "Break & Steal an Egg",
+	LoadingSubtitle = "autofarm",
+	ShowText = "Egg Autofarm",
+	Theme = "Default",
+	ToggleUIKeybind = "K",
+	DisableRayfieldPrompts = false,
+	DisableBuildWarnings = true,
+	-- Rayfield's own saving stays off: restoring the zone clears the egg
+	-- selection, and its restore order is dictionary order, so eggs could be
+	-- applied before the zone and then wiped. The config module applies
+	-- everything in a controlled order instead.
 	ConfigurationSaving = { Enabled = false },
 	Discord = { Enabled = false },
 	KeySystem = false,
 })
 
-local FarmTab = Window:CreateTab("Autofarm", 4483362458)
+----------------------------------------------------------------------
+-- Dashboard
+----------------------------------------------------------------------
 
-statusLabel = FarmTab:CreateLabel("Status: Idle")
+local DashTab = Window:CreateTab("Dashboard", "layout-dashboard")
+
+DashTab:CreateSection("Live")
+
+statusLabel = DashTab:CreateLabel("Status: Idle", "activity")
+
+local sessionParagraph = DashTab:CreateParagraph({
+	Title = "This session",
+	Content = "Not started yet.",
+})
+
+local lifetimeParagraph = DashTab:CreateParagraph({
+	Title = "All time",
+	Content = "No history yet.",
+})
+
+DashTab:CreateDivider()
+DashTab:CreateSection("Quick controls")
+
+local dashToggle = DashTab:CreateToggle({
+	Name = "Autofarm",
+	CurrentValue = false,
+	Flag = "DashAutofarm",
+	Callback = function(value)
+		-- Mirrors the Farming tab's toggle; farmToggle:Set keeps the two in
+		-- step without either callback looping back into the other.
+		if value ~= state.running and farmToggle then
+			pcall(function() farmToggle:Set(value) end)
+		end
+	end,
+})
+
+DashTab:CreateButton({
+	Name = "Reset session stats",
+	Callback = function()
+		stats.startTime = os.clock()
+		stats.eggsBroken = 0
+		stats.animalsStolen = 0
+		stats.delivered = 0
+		stats.gemsCollected = 0
+		stats.valueStolen = 0
+		stats.bestName, stats.bestValue = nil, 0
+		notify("Stats", "Session counters reset")
+	end,
+})
+
+----------------------------------------------------------------------
+-- Farming
+----------------------------------------------------------------------
+
+local FarmTab = Window:CreateTab("Farming", "target")
+
+FarmTab:CreateSection("Zone")
 
 zoneDropdown = FarmTab:CreateDropdown({
 	Name = "Zone",
@@ -2031,8 +2680,18 @@ zoneDropdown = FarmTab:CreateDropdown({
 	end,
 })
 
+FarmTab:CreateToggle({
+	Name = "Rotate zones when one runs dry",
+	CurrentValue = false,
+	Flag = "RotateZones",
+	Callback = function(value)
+		state.rotateZones = value
+		queueSave()
+	end,
+})
+
 FarmTab:CreateButton({
-	Name = "Rescan Zones",
+	Name = "Rescan zones",
 	Callback = function()
 		task.spawn(function()
 			local changed = refreshZones()
@@ -2041,15 +2700,14 @@ FarmTab:CreateButton({
 				parts[#parts + 1] = string.format("%s -> %s", zone.Name, zone.EggFolder or "unmapped")
 			end
 			print("[Autofarm] Zones:\n  " .. table.concat(parts, "\n  "))
-			Rayfield:Notify({
-				Title = changed and "Zones Updated" or "Zones Unchanged",
-				Content = string.format("%d zone(s) found. Mapping printed to console.", #ZONES),
-				Duration = 6,
-				Image = 4483362458,
-			})
+			notify(changed and "Zones updated" or "Zones unchanged",
+				string.format("%d zone(s). Mapping printed to console.", #ZONES))
 		end)
 	end,
 })
+
+FarmTab:CreateDivider()
+FarmTab:CreateSection("Eggs")
 
 eggDropdown = FarmTab:CreateDropdown({
 	Name = "Eggs",
@@ -2069,8 +2727,43 @@ eggDropdown = FarmTab:CreateDropdown({
 	end,
 })
 
+FarmTab:CreateButton({
+	Name = "Select all eggs in this zone",
+	Callback = function()
+		local names = getEggNames(state.zone)
+		if #names == 0 then
+			notify("Eggs", "This zone has no egg list")
+			return
+		end
+
+		local selected = {}
+		for _, name in ipairs(names) do
+			selected[name] = true
+		end
+		state.selectedEggs = selected
+
+		pcall(function() eggDropdown:Set(names) end)
+		queueSave()
+		notify("Eggs", string.format("Selected all %d", #names))
+	end,
+})
+
+FarmTab:CreateButton({
+	Name = "Clear egg selection",
+	Callback = function()
+		state.selectedEggs = {}
+		pcall(function() eggDropdown:Set({}) end)
+		queueSave()
+		notify("Eggs", "Selection cleared")
+	end,
+})
+
+FarmTab:CreateDivider()
+FarmTab:CreateSection("Stealing")
+
 minCpsInput = FarmTab:CreateInput({
-	Name = "Min Cash/s",
+	Name = "Min Cash/s to steal",
+	CurrentValue = "",
 	PlaceholderText = "e.g. 20T",
 	RemoveTextAfterFocusLost = false,
 	Flag = "MinCashPerSecond",
@@ -2080,13 +2773,14 @@ minCpsInput = FarmTab:CreateInput({
 			state.minCps = value
 			state.minCpsText = text
 			queueSave()
-			print("[Autofarm] Threshold set to", value, "from input", text)
 			notify("Threshold", "Stealing animals above " .. text)
 		else
-			notify("Threshold", "Could not read that value, use a format like 20T or 1.5B")
+			notify("Threshold", "Could not read that, use a format like 20T or 1.5B")
 		end
 	end,
 })
+
+FarmTab:CreateDivider()
 
 farmToggle = FarmTab:CreateToggle({
 	Name = "Autofarm",
@@ -2098,22 +2792,24 @@ farmToggle = FarmTab:CreateToggle({
 		else
 			stopFarm()
 		end
+		-- Keep the Dashboard's mirror in step.
+		if dashToggle then
+			pcall(function() dashToggle:Set(value) end)
+		end
 		queueSave()
 	end,
 })
 
-FarmTab:CreateButton({
-	Name = "Print speed info",
-	Callback = printSpeedInfo,
-})
+----------------------------------------------------------------------
+-- Looting
+----------------------------------------------------------------------
 
-FarmTab:CreateButton({
-	Name = "Print animal values",
-	Callback = printAnimalValues,
-})
+local LootTab = Window:CreateTab("Looting", "gem")
 
-gemsToggle = FarmTab:CreateToggle({
-	Name = "Auto Collect Gems",
+LootTab:CreateSection("Gem drops")
+
+gemsToggle = LootTab:CreateToggle({
+	Name = "Auto collect gems",
 	CurrentValue = true,
 	Flag = "AutoCollectGems",
 	Callback = function(value)
@@ -2122,8 +2818,8 @@ gemsToggle = FarmTab:CreateToggle({
 	end,
 })
 
-gemRadiusSlider = FarmTab:CreateSlider({
-	Name = "Gem Search Radius",
+gemRadiusSlider = LootTab:CreateSlider({
+	Name = "Gem search radius",
 	Range = { 25, 600 },
 	Increment = 25,
 	Suffix = " studs",
@@ -2135,8 +2831,8 @@ gemRadiusSlider = FarmTab:CreateSlider({
 	end,
 })
 
-FarmTab:CreateButton({
-	Name = "Collect Gems Now",
+LootTab:CreateButton({
+	Name = "Collect gems now",
 	Callback = function()
 		task.spawn(function()
 			local folder = getGemFolder()
@@ -2151,21 +2847,288 @@ FarmTab:CreateButton({
 				return
 			end
 
-			-- The manual button should work with the farm stopped, and
+			-- The manual sweep should work with the farm stopped, and
 			-- collectGems needs state.running to drive goTo.
 			local wasRunning = state.running
 			state.running = true
-
 			local picked = collectGems(CONFIG.GemRadius, true)
-
 			state.running = wasRunning
+
 			notify("Gems", picked and ("Swept " .. total .. " gem(s)") or "Nothing in range")
 		end)
 	end,
 })
 
-FarmTab:CreateButton({
-	Name = "Save Config",
+----------------------------------------------------------------------
+-- Movement
+----------------------------------------------------------------------
+
+local MoveTab = Window:CreateTab("Movement", "footprints")
+
+MoveTab:CreateSection("Pathfinding")
+
+MoveTab:CreateParagraph({
+	Title = "How movement works",
+	Content = "The route comes from PathfindingService, then raycasts sweep for a clear "
+		.. "heading each step so walls get steered around rather than walked into. "
+		.. "Non-collidable things (eggs, animals, gems) are ignored on purpose.",
+})
+
+MoveTab:CreateSlider({
+	Name = "Obstacle look-ahead",
+	Range = { 4, 24 },
+	Increment = 1,
+	Suffix = " studs",
+	CurrentValue = AVOID_LOOKAHEAD,
+	Flag = "AvoidLookahead",
+	Callback = function(value)
+		AVOID_LOOKAHEAD = value
+	end,
+})
+
+MoveTab:CreateSlider({
+	Name = "Waypoint timeout",
+	Range = { 1, 10 },
+	Increment = 1,
+	Suffix = " s",
+	CurrentValue = CONFIG.WaypointTimeout,
+	Flag = "WaypointTimeout",
+	Callback = function(value)
+		CONFIG.WaypointTimeout = value
+	end,
+})
+
+MoveTab:CreateSlider({
+	Name = "Give up on a goal after",
+	Range = { 10, 90 },
+	Increment = 5,
+	Suffix = " s",
+	CurrentValue = CONFIG.PathGoalTimeout,
+	Flag = "PathGoalTimeout",
+	Callback = function(value)
+		CONFIG.PathGoalTimeout = value
+	end,
+})
+
+MoveTab:CreateDivider()
+MoveTab:CreateSection("Egg approach")
+
+MoveTab:CreateSlider({
+	Name = "Stay radius while breaking",
+	Range = { 2, 15 },
+	Increment = 1,
+	Suffix = " studs",
+	CurrentValue = CONFIG.EggStayRadius,
+	Flag = "EggStayRadius",
+	Callback = function(value)
+		CONFIG.EggStayRadius = value
+	end,
+})
+
+MoveTab:CreateSlider({
+	Name = "Abandon an egg taking no damage after",
+	Range = { 2, 20 },
+	Increment = 1,
+	Suffix = " s",
+	CurrentValue = CONFIG.EggStallTimeout,
+	Flag = "EggStallTimeout",
+	Callback = function(value)
+		CONFIG.EggStallTimeout = value
+	end,
+})
+
+MoveTab:CreateDivider()
+
+MoveTab:CreateButton({
+	Name = "Stop all movement",
+	Callback = function()
+		releaseMoveKeys()
+		clearPathCache()
+		setStatus("Movement cancelled")
+	end,
+})
+
+----------------------------------------------------------------------
+-- Webhook
+----------------------------------------------------------------------
+
+local HookTab = Window:CreateTab("Webhook", "bell")
+
+HookTab:CreateSection("Discord")
+
+local webhookStatus = HookTab:CreateParagraph({
+	Title = "Status",
+	Content = webhookAvailable()
+		and "Executor supports HTTP requests. Paste a webhook URL to begin."
+		or "This executor has no HTTP request function, so webhooks cannot be sent.",
+})
+
+HookTab:CreateInput({
+	Name = "Webhook URL",
+	CurrentValue = "",
+	PlaceholderText = "https://discord.com/api/webhooks/...",
+	RemoveTextAfterFocusLost = false,
+	Flag = "WebhookUrl",
+	Callback = function(text)
+		text = tostring(text or ""):gsub("%s", "")
+
+		if text == "" then
+			state.webhookUrl = nil
+		elseif text:match("^https://discord%.com/api/webhooks/") then
+			state.webhookUrl = text
+			notify("Webhook", "URL saved")
+		else
+			state.webhookUrl = nil
+			notify("Webhook", "That is not a Discord webhook URL")
+		end
+
+		queueSave()
+	end,
+})
+
+HookTab:CreateToggle({
+	Name = "Send notifications",
+	CurrentValue = false,
+	Flag = "WebhookEnabled",
+	Callback = function(value)
+		if value and not webhookAvailable() then
+			notify("Webhook", "Executor has no HTTP request function")
+			return
+		end
+		if value and not state.webhookUrl then
+			notify("Webhook", "Set a webhook URL first")
+			return
+		end
+		state.webhookEnabled = value
+		queueSave()
+	end,
+})
+
+HookTab:CreateInput({
+	Name = "Only notify above",
+	CurrentValue = "",
+	PlaceholderText = "e.g. 100T (blank = every steal)",
+	RemoveTextAfterFocusLost = false,
+	Flag = "WebhookMinValue",
+	Callback = function(text)
+		if tostring(text or ""):gsub("%s", "") == "" then
+			state.webhookMinValue = 0
+			queueSave()
+			return
+		end
+
+		local value = parseMoney(text)
+		if value then
+			state.webhookMinValue = value
+			notify("Webhook", "Only animals above " .. text)
+		else
+			notify("Webhook", "Could not read that value")
+		end
+		queueSave()
+	end,
+})
+
+HookTab:CreateDivider()
+
+HookTab:CreateButton({
+	Name = "Send test message",
+	Callback = function()
+		task.spawn(function()
+			if not state.webhookUrl then
+				notify("Webhook", "Set a webhook URL first")
+				return
+			end
+
+			-- Bypass the enabled flag and the queue so the result is immediate
+			-- and the exact failure reason can be surfaced.
+			local ok, err = postWebhook(baseEmbed("Webhook connected", 3447003, {
+				{ name = "Player", value = LocalPlayer.Name, inline = true },
+				{ name = "Zone", value = state.zone and state.zone.Name or "unknown", inline = true },
+			}))
+
+			notify("Webhook", ok and "Test message sent" or ("Failed: " .. tostring(err)))
+			pcall(function()
+				webhookStatus:Set({
+					Title = "Status",
+					Content = ok and "Last test succeeded." or ("Last test failed: " .. tostring(err)),
+				})
+			end)
+		end)
+	end,
+})
+
+HookTab:CreateButton({
+	Name = "Send session report now",
+	Callback = function()
+		if not state.webhookEnabled then
+			notify("Webhook", "Notifications are off")
+			return
+		end
+		sendSessionReport("Session report")
+		notify("Webhook", "Report queued")
+	end,
+})
+
+----------------------------------------------------------------------
+-- Utility
+----------------------------------------------------------------------
+
+local UtilTab = Window:CreateTab("Utility", "wrench")
+
+UtilTab:CreateSection("Session")
+
+UtilTab:CreateToggle({
+	Name = "Anti-AFK",
+	CurrentValue = true,
+	Flag = "AntiAfk",
+	Callback = function(value)
+		setAntiAfk(value)
+		queueSave()
+	end,
+})
+
+UtilTab:CreateToggle({
+	Name = "Performance mode",
+	CurrentValue = false,
+	Flag = "PerformanceMode",
+	Callback = function(value)
+		setPerformanceMode(value)
+		notify("Performance", value and "Visuals reduced" or "Visuals restored")
+	end,
+})
+
+UtilTab:CreateDivider()
+UtilTab:CreateSection("Server")
+
+UtilTab:CreateButton({
+	Name = "Rejoin this server",
+	Callback = rejoinServer,
+})
+
+UtilTab:CreateButton({
+	Name = "Hop to another server",
+	Callback = function()
+		task.spawn(serverHop)
+	end,
+})
+
+----------------------------------------------------------------------
+-- Settings
+----------------------------------------------------------------------
+
+local SetTab = Window:CreateTab("Settings", "settings")
+
+SetTab:CreateSection("Config")
+
+SetTab:CreateParagraph({
+	Title = "Saving",
+	Content = "Settings save automatically a moment after each change, and load "
+		.. "when the script runs. The autofarm toggle is included, so a saved "
+		.. "session resumes on execute.",
+})
+
+SetTab:CreateButton({
+	Name = "Save config now",
 	Callback = function()
 		local ok, err = saveConfig()
 		if ok then
@@ -2173,7 +3136,7 @@ FarmTab:CreateButton({
 			for _ in pairs(state.selectedEggs) do
 				eggCount = eggCount + 1
 			end
-			notify("Config Saved", string.format("%s, %d egg(s), threshold %s",
+			notify("Config saved", string.format("%s, %d egg(s), threshold %s",
 				state.zone and state.zone.Name or "no zone",
 				eggCount,
 				state.minCpsText or tostring(state.minCps)))
@@ -2183,8 +3146,8 @@ FarmTab:CreateButton({
 	end,
 })
 
-FarmTab:CreateButton({
-	Name = "Load Config",
+SetTab:CreateButton({
+	Name = "Load config",
 	Callback = function()
 		local cfg = loadConfig()
 		if cfg and applyConfig(cfg) then
@@ -2194,6 +3157,110 @@ FarmTab:CreateButton({
 		end
 	end,
 })
+
+SetTab:CreateDivider()
+SetTab:CreateSection("Appearance")
+
+SetTab:CreateDropdown({
+	Name = "Theme",
+	Options = { "Default", "AmberGlow", "Amethyst", "Bloom", "DarkBlue", "Green", "Light", "Ocean", "Serenity" },
+	CurrentOption = { "Default" },
+	MultipleOptions = false,
+	Flag = "Theme",
+	Callback = function(option)
+		local name = type(option) == "table" and option[1] or option
+		-- The docs write ModifyTheme with a dot; accept either in case the
+		-- shipped build differs.
+		local ok = pcall(function() Window.ModifyTheme(name) end)
+		if not ok then
+			pcall(function() Window:ModifyTheme(name) end)
+		end
+	end,
+})
+
+SetTab:CreateDivider()
+SetTab:CreateSection("Diagnostics")
+
+SetTab:CreateButton({
+	Name = "Print animal values",
+	Callback = printAnimalValues,
+})
+
+SetTab:CreateButton({
+	Name = "Print speed info",
+	Callback = printSpeedInfo,
+})
+
+SetTab:CreateButton({
+	Name = "Print zone mapping",
+	Callback = function()
+		local parts = {}
+		for _, zone in ipairs(ZONES) do
+			local eggs = getEggNames(zone)
+			parts[#parts + 1] = string.format("%s -> %s (%d eggs)",
+				zone.Name, zone.EggFolder or "unmapped", #eggs)
+		end
+		print("[Autofarm] Zone mapping:\n  " .. table.concat(parts, "\n  "))
+		notify("Diagnostics", "Printed to console")
+	end,
+})
+
+SetTab:CreateDivider()
+
+SetTab:CreateButton({
+	Name = "Unload script",
+	Callback = function()
+		stopFarm()
+		setAntiAfk(false)
+		setPerformanceMode(false)
+		pcall(function() Rayfield:Destroy() end)
+	end,
+})
+
+----------------------------------------------------------------------
+-- Dashboard refresh
+----------------------------------------------------------------------
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+
+		pcall(function()
+			local elapsed = sessionSeconds()
+
+			sessionParagraph:Set({
+				Title = "This session",
+				Content = string.format(
+					"Runtime: %s\nZone: %s\nAction: %s\n\nEggs broken: %d  (%.0f/hr)\nAnimals stolen: %d  (%.0f/hr)\nDelivered: %d\nGems: %d\n\nValue stolen: %s/s\nBest: %s",
+					formatDuration(elapsed),
+					state.zone and state.zone.Name or "none",
+					state.action or "Idle",
+					stats.eggsBroken, perHour(stats.eggsBroken),
+					stats.animalsStolen, perHour(stats.animalsStolen),
+					stats.delivered,
+					stats.gemsCollected,
+					formatMoney(stats.valueStolen),
+					stats.bestName
+						and string.format("%s (%s)", stats.bestName, formatMoney(stats.bestValue))
+						or "none yet"),
+			})
+
+			lifetimeParagraph:Set({
+				Title = "All time",
+				Content = string.format(
+					"Runtime: %s\nEggs broken: %d\nAnimals stolen: %d\nDelivered: %d\nGems: %d\nBest: %s",
+					formatDuration(lifetime.runtime + elapsed),
+					lifetime.eggsBroken,
+					lifetime.animalsStolen,
+					lifetime.delivered,
+					lifetime.gemsCollected,
+					lifetime.bestName
+						and string.format("%s (%s)", lifetime.bestName, formatMoney(lifetime.bestValue))
+						or "none yet"),
+			})
+		end)
+	end
+end)
 
 ----------------------------------------------------------------------
 -- Startup
