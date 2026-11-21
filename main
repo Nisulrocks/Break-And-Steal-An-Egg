@@ -37,9 +37,17 @@ local CONFIG = {
 	MaxStealAttempts = 5,
 	GemReach = 3,
 	GemTimeout = 12,
-	GemRadius = 250,
+	GemRadius = 500,
 	GemMaxAttempts = 2,
 	GemPickupWait = 0.6,
+	-- Gems are swept in a batch after this many eggs rather than after every
+	-- single one, which keeps the farm moving in a predictable cycle.
+	GemsEveryEggs = 10,
+	-- How often auto-mount re-fires the ride remote.
+	MountInterval = 300,
+	-- A re-pickup of the same animal within this window is the same steal, not
+	-- a new one.
+	StealDedupeWindow = 45,
 }
 
 local PATH_PARAMS = {
@@ -300,6 +308,13 @@ local state = {
 	webhookUrl = nil,
 	webhookEnabled = false,
 	webhookMinValue = 0,
+	highlightEggs = true,
+	autoMount = false,
+	rideable = nil,
+	lastMount = 0,
+	eggsSinceGems = 0,
+	performance = false,
+	theme = "Default",
 }
 
 -- Session counters, plus lifetime totals carried across runs in the config.
@@ -332,6 +347,12 @@ local onAnimalStolen = function() end
 local setZone
 local sendSessionReport
 local setAntiAfk
+local setSlowMode
+local setPerformanceMode
+local formatMoney
+-- applyConfig's theme fallback touches the window, which is created in the UI
+-- section below.
+local Window
 
 local farmToggle
 local eggDropdown
@@ -339,6 +360,25 @@ local zoneDropdown
 local minCpsInput
 local gemsToggle
 local gemRadiusSlider
+local gemCadenceSlider
+local rideableDropdown
+-- applyConfig drives every one of these, and it is defined above the UI, so
+-- they all have to be declared here rather than inline in their tabs.
+local rotateToggle
+local highlightToggle
+local antiAfkToggle
+local perfToggle
+local webhookUrlInput
+local webhookToggle
+local webhookMinInput
+local autoMountToggle
+local mountIntervalSlider
+local themeDropdown
+local lookaheadSlider
+local waypointSlider
+local goalTimeoutSlider
+local eggStaySlider
+local eggStallSlider
 local statusLabel
 
 ----------------------------------------------------------------------
@@ -560,6 +600,42 @@ local function readCashPerSecond(animal)
 		return parseMoney(label.Text)
 	end
 	return nil
+end
+
+-- One animal can be picked up, dropped and picked up again during a single
+-- steal, which used to count as several. Primary key is the instance itself;
+-- when the game recreates it on drop, a name+value signature with a short
+-- cooldown catches the repeat.
+local countedSteals = setmetatable({}, { __mode = "k" })
+local stealSignatures = {}
+
+local function countSteal(animal, value)
+    if countedSteals[animal] then
+        return false
+    end
+
+    local signature = string.format("%s|%s", tostring(animal.Name), tostring(value))
+    local now = os.clock()
+    local seenAt = stealSignatures[signature]
+
+    if seenAt and now - seenAt < (CONFIG.StealDedupeWindow or 45) then
+        -- Same animal back in our hands; refresh the window and do not count.
+        countedSteals[animal] = true
+        stealSignatures[signature] = now
+        return false
+    end
+
+    countedSteals[animal] = true
+    stealSignatures[signature] = now
+
+    -- Keep the signature table from growing for the whole session.
+    for key, stamp in pairs(stealSignatures) do
+        if now - stamp > (CONFIG.StealDedupeWindow or 45) * 4 then
+            stealSignatures[key] = nil
+        end
+    end
+
+    return true
 end
 
 -- Highest earning hatched animal that meets the threshold and hasn't failed too many times
@@ -1210,6 +1286,9 @@ end
 local function collectGems(radius, force)
 	if not state.gems and not force then return false end
 
+	-- Gem runs are travel, so never do them in slow mode.
+	setSlowMode(false)
+
 	local _, _, root = getCharacter()
 	if not root then return false end
 
@@ -1391,10 +1470,190 @@ local function setAutoSwing(on)
 end
 
 ----------------------------------------------------------------------
+-- Slow mode
+----------------------------------------------------------------------
+
+-- The game exposes a slow-mode toggle that drops the character to Roblox's
+-- default 16 walk speed. At full farm speed the character overshoots an egg
+-- and oscillates trying to settle on it, so slow mode is held ON only while
+-- standing on an egg, and OFF for every kind of travel.
+local slowModeOn = false
+
+function setSlowMode(on)
+	on = on and true or false
+	if slowModeOn == on then
+		return
+	end
+
+	local remote = ReplicatedStorage:FindFirstChild("SlowModeRemote")
+	if not remote or not remote:IsA("RemoteEvent") then
+		return
+	end
+
+	local ok = pcall(function()
+		remote:FireServer(on)
+	end)
+
+	if ok then
+		slowModeOn = on
+	end
+end
+
+----------------------------------------------------------------------
+-- Egg highlight
+----------------------------------------------------------------------
+
+-- Shows which egg is being worked on, and doubles as a diagnostic: green means
+-- the HP label was found (so progress can be tracked), red means it was not,
+-- which is exactly the case where the stall watchdog has to guess.
+local eggHighlight = nil
+local highlightedEgg = nil
+
+local function clearEggHighlight()
+	if eggHighlight then
+		pcall(function() eggHighlight:Destroy() end)
+		eggHighlight = nil
+	end
+	highlightedEgg = nil
+end
+
+local function highlightEgg(egg)
+	if not state.highlightEggs then
+		clearEggHighlight()
+		return
+	end
+	if not egg or not egg.Parent then
+		clearEggHighlight()
+		return
+	end
+
+	local hasHp = findEggHpLabel(egg) ~= nil
+	local colour = hasHp and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 45, 45)
+
+	if highlightedEgg ~= egg or not eggHighlight or not eggHighlight.Parent then
+		clearEggHighlight()
+
+		local ok, created = pcall(function()
+			local highlight = Instance.new("Highlight")
+			highlight.Name = "AutofarmTargetEgg"
+			highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			highlight.FillTransparency = 0.6
+			highlight.OutlineTransparency = 0
+			highlight.Adornee = egg
+			highlight.Parent = egg
+			return highlight
+		end)
+
+		if not ok then
+			return
+		end
+
+		eggHighlight = created
+		highlightedEgg = egg
+	end
+
+	-- Re-applied each pass: the HP label can appear a moment after the egg
+	-- does, so the colour has to be able to change from red to green.
+	pcall(function()
+		eggHighlight.FillColor = colour
+		eggHighlight.OutlineColor = colour
+	end)
+end
+
+----------------------------------------------------------------------
+-- Rideable mounts
+----------------------------------------------------------------------
+
+-- Built from ReplicatedStorage.Rideable, so mounts added by an update appear
+-- without touching this script.
+local function getRideableFolder()
+	return ReplicatedStorage:FindFirstChild("Rideable")
+end
+
+local function getRideableNames()
+	local folder = getRideableFolder()
+	local names = {}
+	if not folder then
+		return names
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		names[#names + 1] = child.Name
+	end
+	table.sort(names)
+	return names
+end
+
+-- The mount only works if the player actually owns it, so check the backpack
+-- (and whatever is currently held) before firing.
+local function ownsRideable(name)
+	if not name or name == "" then
+		return false
+	end
+
+	for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), getCharacter() }) do
+		if container and container:FindFirstChild(name) then
+			return true
+		end
+	end
+	return false
+end
+
+local function mountRideable(name)
+	name = name or state.rideable
+	if not name or name == "" then
+		return false, "no rideable selected"
+	end
+
+	if not ownsRideable(name) then
+		return false, "you do not own " .. name
+	end
+
+	local remote = ReplicatedStorage:FindFirstChild("RideRemote")
+	if not remote or not remote:IsA("RemoteEvent") then
+		return false, "RideRemote not found"
+	end
+
+	local ok, err = pcall(function()
+		remote:FireServer("Mount", name)
+	end)
+
+    if not ok then
+		return false, tostring(err)
+	end
+
+	state.lastMount = os.clock()
+	return true
+end
+
+-- Re-mounts on a timer because dismounting happens for all sorts of reasons
+-- (respawn, teleport, being hit) and there is no reliable mounted flag to read.
+task.spawn(function()
+	while true do
+		task.wait(10)
+
+		if state.autoMount and state.rideable then
+			local due = (state.lastMount or 0) + (CONFIG.MountInterval or 300)
+			if os.clock() >= due then
+				local ok, err = mountRideable(state.rideable)
+				if not ok then
+					-- Push the next attempt out so a missing mount does not
+					-- retry every ten seconds forever.
+					state.lastMount = os.clock()
+					warn("[Autofarm] Mount failed:", err)
+				end
+			end
+		end
+	end
+end)
+
+----------------------------------------------------------------------
 -- Actions
 ----------------------------------------------------------------------
 
 local function stealAnimal(animal)
+	-- Travel at full speed; slow mode belongs to egg breaking only.
+	setSlowMode(false)
+
 	local animalPosition = getPosition(animal)
 	local prompt = animalPosition and findClosestStealPrompt(animalPosition)
 	if not prompt then
@@ -1420,18 +1679,27 @@ local function stealAnimal(animal)
 	if isCarrying() then
 		local value = readCashPerSecond(animal) or 0
 
-		stats.animalsStolen += 1
-		stats.valueStolen += value
-		lifetime.animalsStolen += 1
+		-- Dropping an animal and picking the same one up again is one steal,
+		-- not two. Count it once per animal, falling back to a name+value
+		-- signature with a cooldown when the instance gets recreated on drop.
+		local counted = countSteal(animal, value)
 
-		if value > stats.bestValue then
-			stats.bestName, stats.bestValue = animal.Name, value
-		end
-		if value > lifetime.bestValue then
-			lifetime.bestName, lifetime.bestValue = animal.Name, value
+		if counted then
+			stats.animalsStolen += 1
+			stats.valueStolen += value
+			lifetime.animalsStolen += 1
+
+			if value > stats.bestValue then
+				stats.bestName, stats.bestValue = animal.Name, value
+			end
+			if value > lifetime.bestValue then
+				lifetime.bestName, lifetime.bestValue = animal.Name, value
+			end
+
+			onAnimalStolen(animal.Name, value)
 		end
 
-		onAnimalStolen(animal.Name, value)
+		setSlowMode(false)
 		notify("Steal", "Picked up " .. animal.Name)
 	else
 		state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
@@ -1470,6 +1738,8 @@ local function breakEgg(egg)
 			break
 		end
 
+		highlightEgg(egg)
+
 		local distance = flatDistance(root.Position, eggPosition)
 		-- Wider radius to stay than to arrive, so small drift does not trigger
 		-- a fresh approach every few frames.
@@ -1477,6 +1747,8 @@ local function breakEgg(egg)
 
 		if distance > threshold then
 			inPosition = false
+			-- Travel at full speed.
+			setSlowMode(false)
 			goTo(egg, CONFIG.EggReach, stopForSteal, CONFIG.PathGoalTimeout)
 		else
 			if not inPosition then
@@ -1485,6 +1757,10 @@ local function breakEgg(egg)
 				releaseMoveKeys()
 				clearPathCache()
 			end
+
+			-- On the egg: 16 walk speed stops the character sliding past it and
+			-- oscillating back, which full speed could not settle out of.
+			setSlowMode(true)
 
 			local hp = getEggHpText(egg)
 			if hp ~= lastHp then
@@ -1513,7 +1789,12 @@ local function breakEgg(egg)
 	if isEggBroken(egg) then
 		stats.eggsBroken += 1
 		lifetime.eggsBroken += 1
+		state.eggsSinceGems += 1
 	end
+
+	-- Slow mode is for standing on an egg only; everything after this is travel.
+	setSlowMode(false)
+	clearEggHighlight()
 
 	-- Never leave a finished route behind: the next egg is usually close by,
 	-- and a stale path to this one would be reused for it.
@@ -1632,9 +1913,14 @@ local function farmZone()
 		end
 		breakEgg(egg)
 
-		-- Gems land where the egg broke, so sweep the immediate area before
-		-- walking off to the next one.
-		collectGems(CONFIG.GemRadius)
+		-- Batched rather than after every egg: break a run of eggs, then do one
+		-- sweep. Fewer interruptions and a predictable cycle.
+		if state.gems and state.eggsSinceGems >= CONFIG.GemsEveryEggs then
+			state.eggsSinceGems = 0
+			setSlowMode(false)
+			setStatus("Collecting gems")
+			collectGems(CONFIG.GemRadius)
+		end
 	end
 
 	if next(state.selectedEggs) == nil then
@@ -1651,6 +1937,8 @@ local function farmZone()
 end
 
 local function deliverAnimal()
+	-- Full speed for the run home.
+	setSlowMode(false)
 	setStatus("Running animal back to base")
 	local arrived = goTo(state.spawnPart, CONFIG.HomeReach, stopForSteal, CONFIG.PathGoalTimeout)
 	if not arrived and state.running and isCarrying() then
@@ -1716,8 +2004,6 @@ local function mainLoop()
 			if target then
 				setStatus("Stealing " .. target.Name)
 				stealAnimal(target)
-			elseif collectGems(CONFIG.GemRadius) then
-				-- Picked something up; re-evaluate before returning to eggs.
 			else
 				setStatus("Farming eggs")
 				farmZone()
@@ -1767,6 +2053,8 @@ local function stopFarm()
 	state.running = false
 	stopCameraLock()
 	setAutoSwing(false)
+	setSlowMode(false)
+	clearEggHighlight()
 	notify("Autofarm", "Stopped")
 
 	if state.webhookEnabled then
@@ -1969,6 +2257,22 @@ local function collectConfig()
 		webhookUrl   = state.webhookUrl,
 		webhookOn    = state.webhookEnabled,
 		webhookMin   = state.webhookMinValue,
+		highlight    = state.highlightEggs,
+		autoMount    = state.autoMount,
+		rideable     = state.rideable,
+		gemsEvery    = CONFIG.GemsEveryEggs,
+		mountEvery   = CONFIG.MountInterval,
+		eggsSinceGems = state.eggsSinceGems,
+		performance  = state.performance,
+		theme        = state.theme,
+
+		-- Movement tuning from the Movement tab. AVOID_LOOKAHEAD is a plain
+		-- local rather than a CONFIG field, so it is read directly.
+		lookahead       = AVOID_LOOKAHEAD,
+		waypointTimeout = CONFIG.WaypointTimeout,
+		goalTimeout     = CONFIG.PathGoalTimeout,
+		eggStayRadius   = CONFIG.EggStayRadius,
+		eggStallTimeout = CONFIG.EggStallTimeout,
 		-- These counters are incremented live next to the session ones, so
 		-- they already include this run. Only runtime needs the session added,
 		-- because nothing advances it during play.
@@ -2070,15 +2374,38 @@ local function applyConfig(cfg)
 
 	applyingConfig = true
 
-	-- 1. Simple scalars.
+	-- Driving the control rather than the variable keeps the UI and the state
+	-- from drifting apart: Set() fires the control's own callback, which is the
+	-- single place that knows how to apply that setting. applyingConfig stops
+	-- those callbacks from queueing a save mid-load.
+	local function restore(control, value, fallback)
+		local applied = false
+		if control then
+			applied = pcall(function() control:Set(value) end)
+		end
+		-- No control yet (or Set refused): apply it directly so the setting
+		-- still takes effect even if the UI cannot show it.
+		if not applied and fallback then
+			fallback(value)
+		end
+	end
+
+	-- 1. Scalars and toggles.
 	if type(cfg.gemRadius) == "number" then
-		CONFIG.GemRadius = cfg.gemRadius
-		pcall(function() gemRadiusSlider:Set(cfg.gemRadius) end)
+		restore(gemRadiusSlider, cfg.gemRadius, function(v) CONFIG.GemRadius = v end)
 	end
 
 	if type(cfg.gems) == "boolean" then
-		state.gems = cfg.gems
-		pcall(function() gemsToggle:Set(cfg.gems) end)
+		restore(gemsToggle, cfg.gems, function(v) state.gems = v end)
+	end
+
+	if type(cfg.gemsEvery) == "number" then
+		restore(gemCadenceSlider, cfg.gemsEvery, function(v) CONFIG.GemsEveryEggs = v end)
+	end
+
+	if type(cfg.eggsSinceGems) == "number" then
+		-- Resume the sweep cycle where it left off instead of restarting it.
+		state.eggsSinceGems = cfg.eggsSinceGems
 	end
 
 	if type(cfg.pickaxeName) == "string" and cfg.pickaxeName ~= "" then
@@ -2086,22 +2413,88 @@ local function applyConfig(cfg)
 	end
 
 	if type(cfg.rotateZones) == "boolean" then
-		state.rotateZones = cfg.rotateZones
+		restore(rotateToggle, cfg.rotateZones, function(v) state.rotateZones = v end)
 	end
 
+	if type(cfg.highlight) == "boolean" then
+		restore(highlightToggle, cfg.highlight, function(v) state.highlightEggs = v end)
+	end
+
+	-- 2. Movement tuning.
+	if type(cfg.lookahead) == "number" then
+		restore(lookaheadSlider, cfg.lookahead, function(v) AVOID_LOOKAHEAD = v end)
+	end
+	if type(cfg.waypointTimeout) == "number" then
+		restore(waypointSlider, cfg.waypointTimeout, function(v) CONFIG.WaypointTimeout = v end)
+	end
+	if type(cfg.goalTimeout) == "number" then
+		restore(goalTimeoutSlider, cfg.goalTimeout, function(v) CONFIG.PathGoalTimeout = v end)
+	end
+	if type(cfg.eggStayRadius) == "number" then
+		restore(eggStaySlider, cfg.eggStayRadius, function(v) CONFIG.EggStayRadius = v end)
+	end
+	if type(cfg.eggStallTimeout) == "number" then
+		restore(eggStallSlider, cfg.eggStallTimeout, function(v) CONFIG.EggStallTimeout = v end)
+	end
+
+	-- 3. Mounts.
+	if type(cfg.mountEvery) == "number" then
+		restore(mountIntervalSlider, cfg.mountEvery, function(v) CONFIG.MountInterval = v end)
+	end
+
+	if type(cfg.rideable) == "string" and cfg.rideable ~= "" then
+		state.rideable = cfg.rideable
+		restore(rideableDropdown, { cfg.rideable }, nil)
+	end
+
+	if type(cfg.autoMount) == "boolean" then
+		restore(autoMountToggle, cfg.autoMount, function(v) state.autoMount = v end)
+	end
+
+	-- 4. Utility.
 	if type(cfg.antiAfk) == "boolean" then
-		state.antiAfk = cfg.antiAfk
-		setAntiAfk(cfg.antiAfk)
+		restore(antiAfkToggle, cfg.antiAfk, function(v)
+			state.antiAfk = v
+			setAntiAfk(v)
+		end)
 	end
 
+	if type(cfg.performance) == "boolean" and cfg.performance then
+		-- Only restore when it was on; toggling it off at load would run the
+		-- restore path over settings that were never changed.
+		restore(perfToggle, true, function()
+			state.performance = true
+			setPerformanceMode(true)
+		end)
+	end
+
+	if type(cfg.theme) == "string" and cfg.theme ~= "" then
+		state.theme = cfg.theme
+		restore(themeDropdown, { cfg.theme }, function(v)
+			local ok = pcall(function() Window.ModifyTheme(v) end)
+			if not ok then
+				pcall(function() Window:ModifyTheme(v) end)
+			end
+		end)
+	end
+
+	-- 5. Webhook. The URL goes in before the enable flag, because the toggle's
+	-- own callback refuses to turn on without one.
 	if type(cfg.webhookUrl) == "string" and cfg.webhookUrl ~= "" then
 		state.webhookUrl = cfg.webhookUrl
+		restore(webhookUrlInput, cfg.webhookUrl, nil)
 	end
-	if type(cfg.webhookOn) == "boolean" then
-		state.webhookEnabled = cfg.webhookOn and state.webhookUrl ~= nil
-	end
+
 	if type(cfg.webhookMin) == "number" then
 		state.webhookMinValue = cfg.webhookMin
+		if cfg.webhookMin > 0 then
+			restore(webhookMinInput, formatMoney(cfg.webhookMin), nil)
+		end
+	end
+
+	if type(cfg.webhookOn) == "boolean" then
+		local enable = cfg.webhookOn and state.webhookUrl ~= nil
+		restore(webhookToggle, enable, function(v) state.webhookEnabled = v end)
 	end
 
 	-- Lifetime totals are cumulative, so they are loaded rather than merged:
@@ -2191,7 +2584,7 @@ local SUFFIX_ORDER = {
 	{ 1e12, "T" },  { 1e9,  "B" },  { 1e6,  "M" }, { 1e3, "K" },
 }
 
-local function formatMoney(value)
+function formatMoney(value)
 	value = tonumber(value) or 0
 	for _, entry in ipairs(SUFFIX_ORDER) do
 		if value >= entry[1] then
@@ -2382,7 +2775,7 @@ end
 -- toggle can put the game back exactly as it was.
 local perfOriginals = nil
 
-local function setPerformanceMode(enabled)
+function setPerformanceMode(enabled)
 	if enabled then
 		if perfOriginals then
 			return
@@ -2587,7 +2980,7 @@ local function printSpeedInfo()
 	notify("Speed info", "WalkSpeed " .. tostring(hum.WalkSpeed) .. ", check the console (F9)")
 end
 
-local Window = Rayfield:CreateWindow({
+Window = Rayfield:CreateWindow({
 	Name = "Break & Steal an Egg",
 	Icon = "egg",
 	LoadingTitle = "Break & Steal an Egg",
@@ -2680,7 +3073,7 @@ zoneDropdown = FarmTab:CreateDropdown({
 	end,
 })
 
-FarmTab:CreateToggle({
+rotateToggle = FarmTab:CreateToggle({
 	Name = "Rotate zones when one runs dry",
 	CurrentValue = false,
 	Flag = "RotateZones",
@@ -2820,8 +3213,8 @@ gemsToggle = LootTab:CreateToggle({
 
 gemRadiusSlider = LootTab:CreateSlider({
 	Name = "Gem search radius",
-	Range = { 25, 600 },
-	Increment = 25,
+	Range = { 50, 1200 },
+	Increment = 50,
 	Suffix = " studs",
 	CurrentValue = CONFIG.GemRadius,
 	Flag = "GemRadius",
@@ -2830,6 +3223,21 @@ gemRadiusSlider = LootTab:CreateSlider({
 		queueSave()
 	end,
 })
+
+gemCadenceSlider = LootTab:CreateSlider({
+	Name = "Sweep after every",
+	Range = { 1, 50 },
+	Increment = 1,
+	Suffix = " eggs",
+	CurrentValue = CONFIG.GemsEveryEggs,
+	Flag = "GemsEveryEggs",
+	Callback = function(value)
+		CONFIG.GemsEveryEggs = value
+		queueSave()
+	end,
+})
+
+local gemProgressLabel = LootTab:CreateLabel("Eggs since last sweep: 0", "gem")
 
 LootTab:CreateButton({
 	Name = "Collect gems now",
@@ -2860,6 +3268,82 @@ LootTab:CreateButton({
 })
 
 ----------------------------------------------------------------------
+-- Mounts
+----------------------------------------------------------------------
+
+local MountTab = Window:CreateTab("Mounts", "rocket")
+
+MountTab:CreateSection("Rideable")
+
+local mountStatus = MountTab:CreateParagraph({
+	Title = "Status",
+	Content = "Pick a rideable below.",
+})
+
+rideableDropdown = MountTab:CreateDropdown({
+	Name = "Rideable",
+	Options = getRideableNames(),
+	CurrentOption = {},
+	MultipleOptions = false,
+	Flag = "Rideable",
+	Callback = function(option)
+		local name = type(option) == "table" and option[1] or option
+		state.rideable = name
+		-- Mount on the next tick rather than waiting out the interval.
+		state.lastMount = 0
+		queueSave()
+	end,
+})
+
+MountTab:CreateButton({
+	Name = "Refresh rideable list",
+	Callback = function()
+		local names = getRideableNames()
+		pcall(function() rideableDropdown:Refresh(names) end)
+		notify("Mounts", string.format("%d rideable(s) found", #names))
+	end,
+})
+
+autoMountToggle = MountTab:CreateToggle({
+	Name = "Auto mount",
+	CurrentValue = false,
+	Flag = "AutoMount",
+	Callback = function(value)
+		state.autoMount = value
+		if value then
+			-- Do not make the player wait five minutes to see it work.
+			state.lastMount = 0
+		end
+		queueSave()
+	end,
+})
+
+mountIntervalSlider = MountTab:CreateSlider({
+	Name = "Re-mount every",
+	Range = { 30, 900 },
+	Increment = 30,
+	Suffix = " s",
+	CurrentValue = CONFIG.MountInterval,
+	Flag = "MountInterval",
+	Callback = function(value)
+		CONFIG.MountInterval = value
+		queueSave()
+	end,
+})
+
+MountTab:CreateDivider()
+
+MountTab:CreateButton({
+	Name = "Mount now",
+	Callback = function()
+		task.spawn(function()
+			local ok, err = mountRideable(state.rideable)
+			notify("Mounts", ok and ("Mounted " .. tostring(state.rideable)) or ("Failed: " .. tostring(err)))
+		end)
+	end,
+})
+
+----------------------------------------------------------------------
 -- Movement
 ----------------------------------------------------------------------
 
@@ -2874,7 +3358,7 @@ MoveTab:CreateParagraph({
 		.. "Non-collidable things (eggs, animals, gems) are ignored on purpose.",
 })
 
-MoveTab:CreateSlider({
+lookaheadSlider = MoveTab:CreateSlider({
 	Name = "Obstacle look-ahead",
 	Range = { 4, 24 },
 	Increment = 1,
@@ -2883,10 +3367,11 @@ MoveTab:CreateSlider({
 	Flag = "AvoidLookahead",
 	Callback = function(value)
 		AVOID_LOOKAHEAD = value
+		queueSave()
 	end,
 })
 
-MoveTab:CreateSlider({
+waypointSlider = MoveTab:CreateSlider({
 	Name = "Waypoint timeout",
 	Range = { 1, 10 },
 	Increment = 1,
@@ -2895,10 +3380,11 @@ MoveTab:CreateSlider({
 	Flag = "WaypointTimeout",
 	Callback = function(value)
 		CONFIG.WaypointTimeout = value
+		queueSave()
 	end,
 })
 
-MoveTab:CreateSlider({
+goalTimeoutSlider = MoveTab:CreateSlider({
 	Name = "Give up on a goal after",
 	Range = { 10, 90 },
 	Increment = 5,
@@ -2907,13 +3393,14 @@ MoveTab:CreateSlider({
 	Flag = "PathGoalTimeout",
 	Callback = function(value)
 		CONFIG.PathGoalTimeout = value
+		queueSave()
 	end,
 })
 
 MoveTab:CreateDivider()
 MoveTab:CreateSection("Egg approach")
 
-MoveTab:CreateSlider({
+eggStaySlider = MoveTab:CreateSlider({
 	Name = "Stay radius while breaking",
 	Range = { 2, 15 },
 	Increment = 1,
@@ -2922,10 +3409,11 @@ MoveTab:CreateSlider({
 	Flag = "EggStayRadius",
 	Callback = function(value)
 		CONFIG.EggStayRadius = value
+		queueSave()
 	end,
 })
 
-MoveTab:CreateSlider({
+eggStallSlider = MoveTab:CreateSlider({
 	Name = "Abandon an egg taking no damage after",
 	Range = { 2, 20 },
 	Increment = 1,
@@ -2934,7 +3422,31 @@ MoveTab:CreateSlider({
 	Flag = "EggStallTimeout",
 	Callback = function(value)
 		CONFIG.EggStallTimeout = value
+		queueSave()
 	end,
+})
+
+MoveTab:CreateDivider()
+MoveTab:CreateSection("Visuals")
+
+highlightToggle = MoveTab:CreateToggle({
+	Name = "Highlight target egg",
+	CurrentValue = true,
+	Flag = "HighlightEggs",
+	Callback = function(value)
+		state.highlightEggs = value
+		if not value then
+			clearEggHighlight()
+		end
+		queueSave()
+	end,
+})
+
+MoveTab:CreateParagraph({
+	Title = "Highlight colours",
+	Content = "Green means the egg's HP label was found, so damage can be tracked. "
+		.. "Red means it was not, which is when the stall watchdog has to guess "
+		.. "whether the egg is being damaged.",
 })
 
 MoveTab:CreateDivider()
@@ -2963,7 +3475,7 @@ local webhookStatus = HookTab:CreateParagraph({
 		or "This executor has no HTTP request function, so webhooks cannot be sent.",
 })
 
-HookTab:CreateInput({
+webhookUrlInput = HookTab:CreateInput({
 	Name = "Webhook URL",
 	CurrentValue = "",
 	PlaceholderText = "https://discord.com/api/webhooks/...",
@@ -2986,7 +3498,7 @@ HookTab:CreateInput({
 	end,
 })
 
-HookTab:CreateToggle({
+webhookToggle = HookTab:CreateToggle({
 	Name = "Send notifications",
 	CurrentValue = false,
 	Flag = "WebhookEnabled",
@@ -3004,7 +3516,7 @@ HookTab:CreateToggle({
 	end,
 })
 
-HookTab:CreateInput({
+webhookMinInput = HookTab:CreateInput({
 	Name = "Only notify above",
 	CurrentValue = "",
 	PlaceholderText = "e.g. 100T (blank = every steal)",
@@ -3077,7 +3589,7 @@ local UtilTab = Window:CreateTab("Utility", "wrench")
 
 UtilTab:CreateSection("Session")
 
-UtilTab:CreateToggle({
+antiAfkToggle = UtilTab:CreateToggle({
 	Name = "Anti-AFK",
 	CurrentValue = true,
 	Flag = "AntiAfk",
@@ -3087,13 +3599,15 @@ UtilTab:CreateToggle({
 	end,
 })
 
-UtilTab:CreateToggle({
+perfToggle = UtilTab:CreateToggle({
 	Name = "Performance mode",
 	CurrentValue = false,
 	Flag = "PerformanceMode",
 	Callback = function(value)
+		state.performance = value
 		setPerformanceMode(value)
 		notify("Performance", value and "Visuals reduced" or "Visuals restored")
+		queueSave()
 	end,
 })
 
@@ -3161,7 +3675,7 @@ SetTab:CreateButton({
 SetTab:CreateDivider()
 SetTab:CreateSection("Appearance")
 
-SetTab:CreateDropdown({
+themeDropdown = SetTab:CreateDropdown({
 	Name = "Theme",
 	Options = { "Default", "AmberGlow", "Amethyst", "Bloom", "DarkBlue", "Green", "Light", "Ocean", "Serenity" },
 	CurrentOption = { "Default" },
@@ -3171,10 +3685,12 @@ SetTab:CreateDropdown({
 		local name = type(option) == "table" and option[1] or option
 		-- The docs write ModifyTheme with a dot; accept either in case the
 		-- shipped build differs.
+		state.theme = name
 		local ok = pcall(function() Window.ModifyTheme(name) end)
 		if not ok then
 			pcall(function() Window:ModifyTheme(name) end)
 		end
+		queueSave()
 	end,
 })
 
@@ -3244,6 +3760,22 @@ task.spawn(function()
 						and string.format("%s (%s)", stats.bestName, formatMoney(stats.bestValue))
 						or "none yet"),
 			})
+
+			pcall(function()
+				gemProgressLabel:Set(string.format("Eggs since last sweep: %d / %d",
+					state.eggsSinceGems, CONFIG.GemsEveryEggs), "gem")
+			end)
+
+			pcall(function()
+				local owned = state.rideable and ownsRideable(state.rideable)
+				mountStatus:Set({
+					Title = "Status",
+					Content = string.format("Selected: %s\nOwned: %s\nAuto mount: %s",
+						state.rideable or "none",
+						state.rideable and (owned and "yes" or "not in your backpack") or "-",
+						state.autoMount and "on" or "off"),
+				})
+			end)
 
 			lifetimeParagraph:Set({
 				Title = "All time",
