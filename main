@@ -368,35 +368,14 @@ local setPerformanceMode
 local formatMoney
 -- applyConfig's theme fallback touches the window, which is created in the UI
 -- section below.
-local Window
+-- Every UI control and panel lives in this one table. Luau caps a function
+-- at 200 locals, and giving each of the ~40 controls its own top-level local
+-- pushed the script past that limit: compilation failed, loadstring returned
+-- nil, and executing it raised "attempt to call a nil value".
+local UI = {}
 
-local farmToggle
-local eggDropdown
-local zoneDropdown
-local minCpsInput
-local gemsToggle
-local gemRadiusSlider
-local gemCadenceSlider
-local rideableDropdown
 -- applyConfig drives every one of these, and it is defined above the UI, so
 -- they all have to be declared here rather than inline in their tabs.
-local rotateToggle
-local highlightToggle
-local antiAfkToggle
-local perfToggle
-local webhookUrlInput
-local webhookToggle
-local webhookMinInput
-local autoMountToggle
-local mountIntervalSlider
-local themeDropdown
-local lookaheadSlider
-local waypointSlider
-local goalTimeoutSlider
-local eggStaySlider
-local eggStallSlider
-local eggSlowSlider
-local statusLabel
 
 ----------------------------------------------------------------------
 -- Helpers
@@ -408,9 +387,9 @@ end
 
 local function setStatus(text)
 	state.action = text
-	if statusLabel then
+	if UI.statusLabel then
 		pcall(function()
-			statusLabel:Set("Status: " .. text)
+			UI.statusLabel:Set("Status: " .. text)
 		end)
 	end
 end
@@ -2002,7 +1981,7 @@ local function advanceZone()
 			if state.selectedEggs[name] then
 				setStatus("Rotating to " .. candidate.Name)
 				setZone(candidate)
-				pcall(function() zoneDropdown:Set({ candidate.Name }) end)
+				pcall(function() UI.zoneDropdown:Set({ candidate.Name }) end)
 				return true
 			end
 		end
@@ -2278,7 +2257,7 @@ local function startFarm()
 	if not spawnPart then
 		notify("Autofarm", "Could not find your base SpawnPoint")
 		pcall(function()
-			farmToggle:Set(false)
+			UI.farmToggle:Set(false)
 		end)
 		return
 	end
@@ -2323,7 +2302,7 @@ local function startFarm()
 			notify("Autofarm error", tostring(err))
 			stopFarm()
 			pcall(function()
-				farmToggle:Set(false)
+				UI.farmToggle:Set(false)
 			end)
 		end
 	end)
@@ -2365,9 +2344,9 @@ function setZone(zone)
 	-- With ConfigurationSaving on, Rayfield fires this callback while restoring
 	-- the saved zone, which can happen before the Eggs dropdown exists. Nothing
 	-- to refresh yet; it gets built from state.zone immediately after.
-	if not eggDropdown then return end
+	if not UI.eggDropdown then return end
 
-	refreshDropdown(eggDropdown, names, true)
+	refreshDropdown(UI.eggDropdown, names, true)
 
 	if #names == 0 then
 		setStatus(string.format("%s: no eggs found (%s)", zone.Name,
@@ -2400,18 +2379,18 @@ local function refreshZones()
 	-- the list the player is already on.
 	local keptSelection = sameZone and state.selectedEggs or nil
 
-	refreshDropdown(zoneDropdown, zoneNames, false)
+	refreshDropdown(UI.zoneDropdown, zoneNames, false)
 
 	-- Re-point at the rebuilt entry; the old table has been discarded.
 	state.zone = keep
 
-	if zoneDropdown and not sameZone then
+	if UI.zoneDropdown and not sameZone then
 		-- The selected zone genuinely went away, so move the UI to the
 		-- fallback and let the callback reset the egg list.
-		pcall(function() zoneDropdown:Set({ keep.Name }) end)
+		pcall(function() UI.zoneDropdown:Set({ keep.Name }) end)
 	else
 		-- Same zone: refresh the egg options in place and put the selection back.
-		refreshDropdown(eggDropdown, getEggNames(keep), false)
+		refreshDropdown(UI.eggDropdown, getEggNames(keep), false)
 		if keptSelection then
 			state.selectedEggs = keptSelection
 		end
@@ -2590,15 +2569,15 @@ local function applyConfig(cfg)
 
 	-- 1. Scalars and toggles.
 	if type(cfg.gemRadius) == "number" then
-		restore(gemRadiusSlider, cfg.gemRadius, function(v) CONFIG.GemRadius = v end)
+		restore(UI.gemRadiusSlider, cfg.gemRadius, function(v) CONFIG.GemRadius = v end)
 	end
 
 	if type(cfg.gems) == "boolean" then
-		restore(gemsToggle, cfg.gems, function(v) state.gems = v end)
+		restore(UI.gemsToggle, cfg.gems, function(v) state.gems = v end)
 	end
 
 	if type(cfg.gemsEvery) == "number" then
-		restore(gemCadenceSlider, cfg.gemsEvery, function(v) CONFIG.GemsEveryEggs = v end)
+		restore(UI.gemCadenceSlider, cfg.gemsEvery, function(v) CONFIG.GemsEveryEggs = v end)
 	end
 
 	if type(cfg.eggsSinceGems) == "number" then
@@ -2611,50 +2590,50 @@ local function applyConfig(cfg)
 	end
 
 	if type(cfg.rotateZones) == "boolean" then
-		restore(rotateToggle, cfg.rotateZones, function(v) state.rotateZones = v end)
+		restore(UI.rotateToggle, cfg.rotateZones, function(v) state.rotateZones = v end)
 	end
 
 	if type(cfg.highlight) == "boolean" then
-		restore(highlightToggle, cfg.highlight, function(v) state.highlightEggs = v end)
+		restore(UI.highlightToggle, cfg.highlight, function(v) state.highlightEggs = v end)
 	end
 
 	-- 2. Movement tuning.
 	if type(cfg.lookahead) == "number" then
-		restore(lookaheadSlider, cfg.lookahead, function(v) AVOID_LOOKAHEAD = v end)
+		restore(UI.lookaheadSlider, cfg.lookahead, function(v) AVOID_LOOKAHEAD = v end)
 	end
 	if type(cfg.waypointTimeout) == "number" then
-		restore(waypointSlider, cfg.waypointTimeout, function(v) CONFIG.WaypointTimeout = v end)
+		restore(UI.waypointSlider, cfg.waypointTimeout, function(v) CONFIG.WaypointTimeout = v end)
 	end
 	if type(cfg.goalTimeout) == "number" then
-		restore(goalTimeoutSlider, cfg.goalTimeout, function(v) CONFIG.PathGoalTimeout = v end)
+		restore(UI.goalTimeoutSlider, cfg.goalTimeout, function(v) CONFIG.PathGoalTimeout = v end)
 	end
 	if type(cfg.eggStayRadius) == "number" then
-		restore(eggStaySlider, cfg.eggStayRadius, function(v) CONFIG.EggStayRadius = v end)
+		restore(UI.eggStaySlider, cfg.eggStayRadius, function(v) CONFIG.EggStayRadius = v end)
 	end
 	if type(cfg.eggStallTimeout) == "number" then
-		restore(eggStallSlider, cfg.eggStallTimeout, function(v) CONFIG.EggStallTimeout = v end)
+		restore(UI.eggStallSlider, cfg.eggStallTimeout, function(v) CONFIG.EggStallTimeout = v end)
 	end
 	if type(cfg.eggSlowRadius) == "number" then
-		restore(eggSlowSlider, cfg.eggSlowRadius, function(v) CONFIG.EggSlowRadius = v end)
+		restore(UI.eggSlowSlider, cfg.eggSlowRadius, function(v) CONFIG.EggSlowRadius = v end)
 	end
 
 	-- 3. Mounts.
 	if type(cfg.mountEvery) == "number" then
-		restore(mountIntervalSlider, cfg.mountEvery, function(v) CONFIG.MountInterval = v end)
+		restore(UI.mountIntervalSlider, cfg.mountEvery, function(v) CONFIG.MountInterval = v end)
 	end
 
 	if type(cfg.rideable) == "string" and cfg.rideable ~= "" then
 		state.rideable = cfg.rideable
-		restore(rideableDropdown, { cfg.rideable }, nil)
+		restore(UI.rideableDropdown, { cfg.rideable }, nil)
 	end
 
 	if type(cfg.autoMount) == "boolean" then
-		restore(autoMountToggle, cfg.autoMount, function(v) state.autoMount = v end)
+		restore(UI.autoMountToggle, cfg.autoMount, function(v) state.autoMount = v end)
 	end
 
 	-- 4. Utility.
 	if type(cfg.antiAfk) == "boolean" then
-		restore(antiAfkToggle, cfg.antiAfk, function(v)
+		restore(UI.antiAfkToggle, cfg.antiAfk, function(v)
 			state.antiAfk = v
 			setAntiAfk(v)
 		end)
@@ -2663,7 +2642,7 @@ local function applyConfig(cfg)
 	if type(cfg.performance) == "boolean" and cfg.performance then
 		-- Only restore when it was on; toggling it off at load would run the
 		-- restore path over settings that were never changed.
-		restore(perfToggle, true, function()
+		restore(UI.perfToggle, true, function()
 			state.performance = true
 			setPerformanceMode(true)
 		end)
@@ -2671,10 +2650,10 @@ local function applyConfig(cfg)
 
 	if type(cfg.theme) == "string" and cfg.theme ~= "" then
 		state.theme = cfg.theme
-		restore(themeDropdown, { cfg.theme }, function(v)
-			local ok = pcall(function() Window.ModifyTheme(v) end)
+		restore(UI.themeDropdown, { cfg.theme }, function(v)
+			local ok = pcall(function() UI.Window.ModifyTheme(v) end)
 			if not ok then
-				pcall(function() Window:ModifyTheme(v) end)
+				pcall(function() UI.Window:ModifyTheme(v) end)
 			end
 		end)
 	end
@@ -2683,19 +2662,19 @@ local function applyConfig(cfg)
 	-- own callback refuses to turn on without one.
 	if type(cfg.webhookUrl) == "string" and cfg.webhookUrl ~= "" then
 		state.webhookUrl = cfg.webhookUrl
-		restore(webhookUrlInput, cfg.webhookUrl, nil)
+		restore(UI.webhookUrlInput, cfg.webhookUrl, nil)
 	end
 
 	if type(cfg.webhookMin) == "number" then
 		state.webhookMinValue = cfg.webhookMin
 		if cfg.webhookMin > 0 then
-			restore(webhookMinInput, formatMoney(cfg.webhookMin), nil)
+			restore(UI.webhookMinInput, formatMoney(cfg.webhookMin), nil)
 		end
 	end
 
 	if type(cfg.webhookOn) == "boolean" then
 		local enable = cfg.webhookOn and state.webhookUrl ~= nil
-		restore(webhookToggle, enable, function(v) state.webhookEnabled = v end)
+		restore(UI.webhookToggle, enable, function(v) state.webhookEnabled = v end)
 	end
 
 	-- Lifetime totals are cumulative, so they are loaded rather than merged:
@@ -2716,7 +2695,7 @@ local function applyConfig(cfg)
 		for _, zone in ipairs(ZONES) do
 			if zone.Number == cfg.zoneNumber then
 				setZone(zone)
-				pcall(function() zoneDropdown:Set({ zone.Name }) end)
+				pcall(function() UI.zoneDropdown:Set({ zone.Name }) end)
 				break
 			end
 		end
@@ -2740,7 +2719,7 @@ local function applyConfig(cfg)
 
 		if #restored > 0 then
 			state.selectedEggs = selected
-			pcall(function() eggDropdown:Set(restored) end)
+			pcall(function() UI.eggDropdown:Set(restored) end)
 		end
 	end
 
@@ -2751,7 +2730,7 @@ local function applyConfig(cfg)
 		if value then
 			state.minCps = value
 			state.minCpsText = cfg.minCpsText
-			pcall(function() minCpsInput:Set(cfg.minCpsText) end)
+			pcall(function() UI.minCpsInput:Set(cfg.minCpsText) end)
 		end
 	elseif type(cfg.minCps) == "number" then
 		state.minCps = cfg.minCps
@@ -2765,7 +2744,7 @@ local function applyConfig(cfg)
 	-- would otherwise block whoever asked for the config to be applied.
 	if cfg.autofarm == true and not state.running then
 		task.spawn(function()
-			pcall(function() farmToggle:Set(true) end)
+			pcall(function() UI.farmToggle:Set(true) end)
 		end)
 	end
 
@@ -3181,7 +3160,7 @@ local function printSpeedInfo()
 	notify("Speed info", "WalkSpeed " .. tostring(hum.WalkSpeed) .. ", check the console (F9)")
 end
 
-Window = Rayfield:CreateWindow({
+UI.Window = Rayfield:CreateWindow({
 	Name = "Break & Steal an Egg",
 	Icon = "egg",
 	LoadingTitle = "Break & Steal an Egg",
@@ -3204,39 +3183,39 @@ Window = Rayfield:CreateWindow({
 -- Dashboard
 ----------------------------------------------------------------------
 
-local DashTab = Window:CreateTab("Dashboard", "layout-dashboard")
+UI.DashTab = UI.Window:CreateTab("Dashboard", "layout-dashboard")
 
-DashTab:CreateSection("Live")
+UI.DashTab:CreateSection("Live")
 
-statusLabel = DashTab:CreateLabel("Status: Idle", "activity")
+UI.statusLabel = UI.DashTab:CreateLabel("Status: Idle", "activity")
 
-local sessionParagraph = DashTab:CreateParagraph({
+UI.sessionParagraph = UI.DashTab:CreateParagraph({
 	Title = "This session",
 	Content = "Not started yet.",
 })
 
-local lifetimeParagraph = DashTab:CreateParagraph({
+UI.lifetimeParagraph = UI.DashTab:CreateParagraph({
 	Title = "All time",
 	Content = "No history yet.",
 })
 
-DashTab:CreateDivider()
-DashTab:CreateSection("Quick controls")
+UI.DashTab:CreateDivider()
+UI.DashTab:CreateSection("Quick controls")
 
-local dashToggle = DashTab:CreateToggle({
+UI.dashToggle = UI.DashTab:CreateToggle({
 	Name = "Autofarm",
 	CurrentValue = false,
 	Flag = "DashAutofarm",
 	Callback = function(value)
 		-- Mirrors the Farming tab's toggle; farmToggle:Set keeps the two in
 		-- step without either callback looping back into the other.
-		if value ~= state.running and farmToggle then
-			pcall(function() farmToggle:Set(value) end)
+		if value ~= state.running and UI.farmToggle then
+			pcall(function() UI.farmToggle:Set(value) end)
 		end
 	end,
 })
 
-DashTab:CreateButton({
+UI.DashTab:CreateButton({
 	Name = "Reset session stats",
 	Callback = function()
 		stats.startTime = os.clock()
@@ -3254,11 +3233,11 @@ DashTab:CreateButton({
 -- Farming
 ----------------------------------------------------------------------
 
-local FarmTab = Window:CreateTab("Farming", "target")
+UI.FarmTab = UI.Window:CreateTab("Farming", "target")
 
-FarmTab:CreateSection("Zone")
+UI.FarmTab:CreateSection("Zone")
 
-zoneDropdown = FarmTab:CreateDropdown({
+UI.zoneDropdown = UI.FarmTab:CreateDropdown({
 	Name = "Zone",
 	Options = zoneNames,
 	CurrentOption = { zoneNames[1] },
@@ -3274,7 +3253,7 @@ zoneDropdown = FarmTab:CreateDropdown({
 	end,
 })
 
-rotateToggle = FarmTab:CreateToggle({
+UI.rotateToggle = UI.FarmTab:CreateToggle({
 	Name = "Rotate zones when one runs dry",
 	CurrentValue = false,
 	Flag = "RotateZones",
@@ -3284,7 +3263,7 @@ rotateToggle = FarmTab:CreateToggle({
 	end,
 })
 
-FarmTab:CreateButton({
+UI.FarmTab:CreateButton({
 	Name = "Rescan zones",
 	Callback = function()
 		task.spawn(function()
@@ -3300,10 +3279,10 @@ FarmTab:CreateButton({
 	end,
 })
 
-FarmTab:CreateDivider()
-FarmTab:CreateSection("Eggs")
+UI.FarmTab:CreateDivider()
+UI.FarmTab:CreateSection("Eggs")
 
-eggDropdown = FarmTab:CreateDropdown({
+UI.eggDropdown = UI.FarmTab:CreateDropdown({
 	Name = "Eggs",
 	Options = getEggNames(state.zone),
 	CurrentOption = {},
@@ -3321,7 +3300,7 @@ eggDropdown = FarmTab:CreateDropdown({
 	end,
 })
 
-FarmTab:CreateButton({
+UI.FarmTab:CreateButton({
 	Name = "Select all eggs in this zone",
 	Callback = function()
 		local names = getEggNames(state.zone)
@@ -3336,26 +3315,26 @@ FarmTab:CreateButton({
 		end
 		state.selectedEggs = selected
 
-		pcall(function() eggDropdown:Set(names) end)
+		pcall(function() UI.eggDropdown:Set(names) end)
 		queueSave()
 		notify("Eggs", string.format("Selected all %d", #names))
 	end,
 })
 
-FarmTab:CreateButton({
+UI.FarmTab:CreateButton({
 	Name = "Clear egg selection",
 	Callback = function()
 		state.selectedEggs = {}
-		pcall(function() eggDropdown:Set({}) end)
+		pcall(function() UI.eggDropdown:Set({}) end)
 		queueSave()
 		notify("Eggs", "Selection cleared")
 	end,
 })
 
-FarmTab:CreateDivider()
-FarmTab:CreateSection("Stealing")
+UI.FarmTab:CreateDivider()
+UI.FarmTab:CreateSection("Stealing")
 
-minCpsInput = FarmTab:CreateInput({
+UI.minCpsInput = UI.FarmTab:CreateInput({
 	Name = "Min Cash/s to steal",
 	CurrentValue = "",
 	PlaceholderText = "e.g. 20T",
@@ -3374,9 +3353,9 @@ minCpsInput = FarmTab:CreateInput({
 	end,
 })
 
-FarmTab:CreateDivider()
+UI.FarmTab:CreateDivider()
 
-farmToggle = FarmTab:CreateToggle({
+UI.farmToggle = UI.FarmTab:CreateToggle({
 	Name = "Autofarm",
 	CurrentValue = false,
 	Flag = "AutofarmToggle",
@@ -3387,8 +3366,8 @@ farmToggle = FarmTab:CreateToggle({
 			stopFarm()
 		end
 		-- Keep the Dashboard's mirror in step.
-		if dashToggle then
-			pcall(function() dashToggle:Set(value) end)
+		if UI.dashToggle then
+			pcall(function() UI.dashToggle:Set(value) end)
 		end
 		queueSave()
 	end,
@@ -3398,11 +3377,11 @@ farmToggle = FarmTab:CreateToggle({
 -- Looting
 ----------------------------------------------------------------------
 
-local LootTab = Window:CreateTab("Looting", "gem")
+UI.LootTab = UI.Window:CreateTab("Looting", "gem")
 
-LootTab:CreateSection("Gem drops")
+UI.LootTab:CreateSection("Gem drops")
 
-gemsToggle = LootTab:CreateToggle({
+UI.gemsToggle = UI.LootTab:CreateToggle({
 	Name = "Auto collect gems",
 	CurrentValue = true,
 	Flag = "AutoCollectGems",
@@ -3412,7 +3391,7 @@ gemsToggle = LootTab:CreateToggle({
 	end,
 })
 
-gemRadiusSlider = LootTab:CreateSlider({
+UI.gemRadiusSlider = UI.LootTab:CreateSlider({
 	Name = "Gem search radius",
 	Range = { 50, 1200 },
 	Increment = 50,
@@ -3425,7 +3404,7 @@ gemRadiusSlider = LootTab:CreateSlider({
 	end,
 })
 
-gemCadenceSlider = LootTab:CreateSlider({
+UI.gemCadenceSlider = UI.LootTab:CreateSlider({
 	Name = "Sweep after every",
 	Range = { 1, 50 },
 	Increment = 1,
@@ -3438,9 +3417,9 @@ gemCadenceSlider = LootTab:CreateSlider({
 	end,
 })
 
-local gemProgressLabel = LootTab:CreateLabel("Eggs since last sweep: 0", "gem")
+UI.gemProgressLabel = UI.LootTab:CreateLabel("Eggs since last sweep: 0", "gem")
 
-LootTab:CreateButton({
+UI.LootTab:CreateButton({
 	Name = "Collect gems now",
 	Callback = function()
 		task.spawn(function()
@@ -3472,16 +3451,16 @@ LootTab:CreateButton({
 -- Mounts
 ----------------------------------------------------------------------
 
-local MountTab = Window:CreateTab("Mounts", "rocket")
+UI.MountTab = UI.Window:CreateTab("Mounts", "rocket")
 
-MountTab:CreateSection("Rideable")
+UI.MountTab:CreateSection("Rideable")
 
-local mountStatus = MountTab:CreateParagraph({
+UI.mountStatus = UI.MountTab:CreateParagraph({
 	Title = "Status",
 	Content = "Pick a rideable below.",
 })
 
-rideableDropdown = MountTab:CreateDropdown({
+UI.rideableDropdown = UI.MountTab:CreateDropdown({
 	Name = "Rideable",
 	Options = getRideableNames(),
 	CurrentOption = {},
@@ -3501,16 +3480,16 @@ rideableDropdown = MountTab:CreateDropdown({
 	end,
 })
 
-MountTab:CreateButton({
+UI.MountTab:CreateButton({
 	Name = "Refresh rideable list",
 	Callback = function()
 		local names = getRideableNames()
-		pcall(function() rideableDropdown:Refresh(names) end)
+		pcall(function() UI.rideableDropdown:Refresh(names) end)
 		notify("Mounts", string.format("%d rideable(s) found", #names))
 	end,
 })
 
-autoMountToggle = MountTab:CreateToggle({
+UI.autoMountToggle = UI.MountTab:CreateToggle({
 	Name = "Auto mount",
 	CurrentValue = false,
 	Flag = "AutoMount",
@@ -3530,7 +3509,7 @@ autoMountToggle = MountTab:CreateToggle({
 	end,
 })
 
-mountIntervalSlider = MountTab:CreateSlider({
+UI.mountIntervalSlider = UI.MountTab:CreateSlider({
 	Name = "Re-mount every",
 	Range = { 30, 900 },
 	Increment = 30,
@@ -3543,9 +3522,9 @@ mountIntervalSlider = MountTab:CreateSlider({
 	end,
 })
 
-MountTab:CreateDivider()
+UI.MountTab:CreateDivider()
 
-MountTab:CreateButton({
+UI.MountTab:CreateButton({
 	Name = "Mount now",
 	Callback = function()
 		task.spawn(function()
@@ -3561,18 +3540,18 @@ MountTab:CreateButton({
 -- Movement
 ----------------------------------------------------------------------
 
-local MoveTab = Window:CreateTab("Movement", "footprints")
+UI.MoveTab = UI.Window:CreateTab("Movement", "footprints")
 
-MoveTab:CreateSection("Pathfinding")
+UI.MoveTab:CreateSection("Pathfinding")
 
-MoveTab:CreateParagraph({
+UI.MoveTab:CreateParagraph({
 	Title = "How movement works",
 	Content = "The route comes from PathfindingService, then raycasts sweep for a clear "
 		.. "heading each step so walls get steered around rather than walked into. "
 		.. "Non-collidable things (eggs, animals, gems) are ignored on purpose.",
 })
 
-lookaheadSlider = MoveTab:CreateSlider({
+UI.lookaheadSlider = UI.MoveTab:CreateSlider({
 	Name = "Obstacle look-ahead",
 	Range = { 4, 24 },
 	Increment = 1,
@@ -3585,7 +3564,7 @@ lookaheadSlider = MoveTab:CreateSlider({
 	end,
 })
 
-waypointSlider = MoveTab:CreateSlider({
+UI.waypointSlider = UI.MoveTab:CreateSlider({
 	Name = "Waypoint timeout",
 	Range = { 1, 10 },
 	Increment = 1,
@@ -3598,7 +3577,7 @@ waypointSlider = MoveTab:CreateSlider({
 	end,
 })
 
-goalTimeoutSlider = MoveTab:CreateSlider({
+UI.goalTimeoutSlider = UI.MoveTab:CreateSlider({
 	Name = "Give up on a goal after",
 	Range = { 10, 90 },
 	Increment = 5,
@@ -3611,10 +3590,10 @@ goalTimeoutSlider = MoveTab:CreateSlider({
 	end,
 })
 
-MoveTab:CreateDivider()
-MoveTab:CreateSection("Egg approach")
+UI.MoveTab:CreateDivider()
+UI.MoveTab:CreateSection("Egg approach")
 
-eggStaySlider = MoveTab:CreateSlider({
+UI.eggStaySlider = UI.MoveTab:CreateSlider({
 	Name = "Stay radius while breaking",
 	Range = { 2, 15 },
 	Increment = 1,
@@ -3627,7 +3606,7 @@ eggStaySlider = MoveTab:CreateSlider({
 	end,
 })
 
-eggSlowSlider = MoveTab:CreateSlider({
+UI.eggSlowSlider = UI.MoveTab:CreateSlider({
 	Name = "Slow mode within",
 	Range = { 4, 60 },
 	Increment = 2,
@@ -3640,7 +3619,7 @@ eggSlowSlider = MoveTab:CreateSlider({
 	end,
 })
 
-eggStallSlider = MoveTab:CreateSlider({
+UI.eggStallSlider = UI.MoveTab:CreateSlider({
 	Name = "Abandon an egg taking no damage after",
 	Range = { 2, 20 },
 	Increment = 1,
@@ -3653,10 +3632,10 @@ eggStallSlider = MoveTab:CreateSlider({
 	end,
 })
 
-MoveTab:CreateDivider()
-MoveTab:CreateSection("Visuals")
+UI.MoveTab:CreateDivider()
+UI.MoveTab:CreateSection("Visuals")
 
-highlightToggle = MoveTab:CreateToggle({
+UI.highlightToggle = UI.MoveTab:CreateToggle({
 	Name = "Highlight target egg",
 	CurrentValue = true,
 	Flag = "HighlightEggs",
@@ -3669,21 +3648,21 @@ highlightToggle = MoveTab:CreateToggle({
 	end,
 })
 
-local slowModeParagraph = MoveTab:CreateParagraph({
+UI.slowModeParagraph = UI.MoveTab:CreateParagraph({
 	Title = "Slow mode",
 	Content = "Checking...",
 })
 
-MoveTab:CreateParagraph({
+UI.MoveTab:CreateParagraph({
 	Title = "Highlight colours",
 	Content = "Green means the egg's HP label was found, so damage can be tracked. "
 		.. "Red means it was not, which is when the stall watchdog has to guess "
 		.. "whether the egg is being damaged.",
 })
 
-MoveTab:CreateDivider()
+UI.MoveTab:CreateDivider()
 
-MoveTab:CreateButton({
+UI.MoveTab:CreateButton({
 	Name = "Stop all movement",
 	Callback = function()
 		releaseMoveKeys()
@@ -3696,18 +3675,18 @@ MoveTab:CreateButton({
 -- Webhook
 ----------------------------------------------------------------------
 
-local HookTab = Window:CreateTab("Webhook", "bell")
+UI.HookTab = UI.Window:CreateTab("Webhook", "bell")
 
-HookTab:CreateSection("Discord")
+UI.HookTab:CreateSection("Discord")
 
-local webhookStatus = HookTab:CreateParagraph({
+UI.webhookStatus = UI.HookTab:CreateParagraph({
 	Title = "Status",
 	Content = webhookAvailable()
 		and "Executor supports HTTP requests. Paste a webhook URL to begin."
 		or "This executor has no HTTP request function, so webhooks cannot be sent.",
 })
 
-webhookUrlInput = HookTab:CreateInput({
+UI.webhookUrlInput = UI.HookTab:CreateInput({
 	Name = "Webhook URL",
 	CurrentValue = "",
 	PlaceholderText = "https://discord.com/api/webhooks/...",
@@ -3730,7 +3709,7 @@ webhookUrlInput = HookTab:CreateInput({
 	end,
 })
 
-webhookToggle = HookTab:CreateToggle({
+UI.webhookToggle = UI.HookTab:CreateToggle({
 	Name = "Send notifications",
 	CurrentValue = false,
 	Flag = "WebhookEnabled",
@@ -3748,7 +3727,7 @@ webhookToggle = HookTab:CreateToggle({
 	end,
 })
 
-webhookMinInput = HookTab:CreateInput({
+UI.webhookMinInput = UI.HookTab:CreateInput({
 	Name = "Only notify above",
 	CurrentValue = "",
 	PlaceholderText = "e.g. 100T (blank = every steal)",
@@ -3772,9 +3751,9 @@ webhookMinInput = HookTab:CreateInput({
 	end,
 })
 
-HookTab:CreateDivider()
+UI.HookTab:CreateDivider()
 
-HookTab:CreateButton({
+UI.HookTab:CreateButton({
 	Name = "Send test message",
 	Callback = function()
 		task.spawn(function()
@@ -3792,7 +3771,7 @@ HookTab:CreateButton({
 
 			notify("Webhook", ok and "Test message sent" or ("Failed: " .. tostring(err)))
 			pcall(function()
-				webhookStatus:Set({
+				UI.webhookStatus:Set({
 					Title = "Status",
 					Content = ok and "Last test succeeded." or ("Last test failed: " .. tostring(err)),
 				})
@@ -3801,7 +3780,7 @@ HookTab:CreateButton({
 	end,
 })
 
-HookTab:CreateButton({
+UI.HookTab:CreateButton({
 	Name = "Send session report now",
 	Callback = function()
 		if not state.webhookEnabled then
@@ -3817,11 +3796,11 @@ HookTab:CreateButton({
 -- Utility
 ----------------------------------------------------------------------
 
-local UtilTab = Window:CreateTab("Utility", "wrench")
+UI.UtilTab = UI.Window:CreateTab("Utility", "wrench")
 
-UtilTab:CreateSection("Session")
+UI.UtilTab:CreateSection("Session")
 
-antiAfkToggle = UtilTab:CreateToggle({
+UI.antiAfkToggle = UI.UtilTab:CreateToggle({
 	Name = "Anti-AFK",
 	CurrentValue = true,
 	Flag = "AntiAfk",
@@ -3831,7 +3810,7 @@ antiAfkToggle = UtilTab:CreateToggle({
 	end,
 })
 
-perfToggle = UtilTab:CreateToggle({
+UI.perfToggle = UI.UtilTab:CreateToggle({
 	Name = "Performance mode",
 	CurrentValue = false,
 	Flag = "PerformanceMode",
@@ -3843,15 +3822,15 @@ perfToggle = UtilTab:CreateToggle({
 	end,
 })
 
-UtilTab:CreateDivider()
-UtilTab:CreateSection("Server")
+UI.UtilTab:CreateDivider()
+UI.UtilTab:CreateSection("Server")
 
-UtilTab:CreateButton({
+UI.UtilTab:CreateButton({
 	Name = "Rejoin this server",
 	Callback = rejoinServer,
 })
 
-UtilTab:CreateButton({
+UI.UtilTab:CreateButton({
 	Name = "Hop to another server",
 	Callback = function()
 		task.spawn(serverHop)
@@ -3862,18 +3841,18 @@ UtilTab:CreateButton({
 -- Settings
 ----------------------------------------------------------------------
 
-local SetTab = Window:CreateTab("Settings", "settings")
+UI.SetTab = UI.Window:CreateTab("Settings", "settings")
 
-SetTab:CreateSection("Config")
+UI.SetTab:CreateSection("Config")
 
-SetTab:CreateParagraph({
+UI.SetTab:CreateParagraph({
 	Title = "Saving",
 	Content = "Settings save automatically a moment after each change, and load "
 		.. "when the script runs. The autofarm toggle is included, so a saved "
 		.. "session resumes on execute.",
 })
 
-SetTab:CreateButton({
+UI.SetTab:CreateButton({
 	Name = "Save config now",
 	Callback = function()
 		local ok, err = saveConfig()
@@ -3892,7 +3871,7 @@ SetTab:CreateButton({
 	end,
 })
 
-SetTab:CreateButton({
+UI.SetTab:CreateButton({
 	Name = "Load config",
 	Callback = function()
 		local cfg = loadConfig()
@@ -3904,10 +3883,10 @@ SetTab:CreateButton({
 	end,
 })
 
-SetTab:CreateDivider()
-SetTab:CreateSection("Appearance")
+UI.SetTab:CreateDivider()
+UI.SetTab:CreateSection("Appearance")
 
-themeDropdown = SetTab:CreateDropdown({
+UI.themeDropdown = UI.SetTab:CreateDropdown({
 	Name = "Theme",
 	Options = { "Default", "AmberGlow", "Amethyst", "Bloom", "DarkBlue", "Green", "Light", "Ocean", "Serenity" },
 	CurrentOption = { "Default" },
@@ -3918,28 +3897,28 @@ themeDropdown = SetTab:CreateDropdown({
 		-- The docs write ModifyTheme with a dot; accept either in case the
 		-- shipped build differs.
 		state.theme = name
-		local ok = pcall(function() Window.ModifyTheme(name) end)
+		local ok = pcall(function() UI.Window.ModifyTheme(name) end)
 		if not ok then
-			pcall(function() Window:ModifyTheme(name) end)
+			pcall(function() UI.Window:ModifyTheme(name) end)
 		end
 		queueSave()
 	end,
 })
 
-SetTab:CreateDivider()
-SetTab:CreateSection("Diagnostics")
+UI.SetTab:CreateDivider()
+UI.SetTab:CreateSection("Diagnostics")
 
-SetTab:CreateButton({
+UI.SetTab:CreateButton({
 	Name = "Print animal values",
 	Callback = printAnimalValues,
 })
 
-SetTab:CreateButton({
+UI.SetTab:CreateButton({
 	Name = "Print speed info",
 	Callback = printSpeedInfo,
 })
 
-SetTab:CreateButton({
+UI.SetTab:CreateButton({
 	Name = "Print zone mapping",
 	Callback = function()
 		local parts = {}
@@ -3953,9 +3932,9 @@ SetTab:CreateButton({
 	end,
 })
 
-SetTab:CreateDivider()
+UI.SetTab:CreateDivider()
 
-SetTab:CreateButton({
+UI.SetTab:CreateButton({
 	Name = "Unload script",
 	Callback = function()
 		stopFarm()
@@ -3976,7 +3955,7 @@ task.spawn(function()
 		pcall(function()
 			local elapsed = sessionSeconds()
 
-			sessionParagraph:Set({
+			UI.sessionParagraph:Set({
 				Title = "This session",
 				Content = string.format(
 					"Runtime: %s\nZone: %s\nAction: %s\n\nEggs broken: %d  (%.0f/hr)\nAnimals stolen: %d  (%.0f/hr)\nDelivered: %d\nGems: %d\n\nValue stolen: %s/s\nBest: %s",
@@ -3994,7 +3973,7 @@ task.spawn(function()
 			})
 
 			pcall(function()
-				slowModeParagraph:Set({
+				UI.slowModeParagraph:Set({
 					Title = "Slow mode",
 					Content = string.format("Remote: %s\nCurrently: %s\nEngages within %d studs of the target egg.",
 						slowModeRemoteStatus,
@@ -4004,13 +3983,13 @@ task.spawn(function()
 			end)
 
 			pcall(function()
-				gemProgressLabel:Set(string.format("Eggs since last sweep: %d / %d",
+				UI.gemProgressLabel:Set(string.format("Eggs since last sweep: %d / %d",
 					state.eggsSinceGems, CONFIG.GemsEveryEggs), "gem")
 			end)
 
 			pcall(function()
 				local owned = state.rideable and ownsRideable(state.rideable)
-				mountStatus:Set({
+				UI.mountStatus:Set({
 					Title = "Status",
 					Content = string.format("Selected: %s\nOwned: %s\nAuto mount: %s\nNext mount: %s",
 						state.rideable or "none",
@@ -4022,7 +4001,7 @@ task.spawn(function()
 				})
 			end)
 
-			lifetimeParagraph:Set({
+			UI.lifetimeParagraph:Set({
 				Title = "All time",
 				Content = string.format(
 					"Runtime: %s\nEggs broken: %d\nAnimals stolen: %d\nDelivered: %d\nGems: %d\nBest: %s",
