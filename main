@@ -42,12 +42,27 @@ local CONFIG = {
 	GemPickupWait = 0.6,
 	-- Gems are swept in a batch after this many eggs rather than after every
 	-- single one, which keeps the farm moving in a predictable cycle.
+	-- Slow mode has to engage on the APPROACH, not on arrival. Gating it on
+	-- EggReach meant it only turned on once the character had already settled
+	-- within 1.5 studs - which at full speed it could never do, so slow mode
+	-- never came on at all.
+	EggSlowRadius = 18,
 	GemsEveryEggs = 10,
 	-- How often auto-mount re-fires the ride remote.
 	MountInterval = 300,
+	-- A failed mount (not owned yet, backpack still loading) retries this soon
+	-- rather than waiting a whole interval.
+	MountRetry = 15,
 	-- A re-pickup of the same animal within this window is the same steal, not
 	-- a new one.
 	StealDedupeWindow = 45,
+	-- An animal that has failed MaxStealAttempts times is skipped, but only
+	-- for this long. Excluding it permanently meant a valuable animal behind
+	-- an awkward spot was ignored for the rest of the session.
+	StealRetryAfter = 60,
+	-- How often the "is there something worth stealing?" check refreshes.
+	-- Every interruptible wait polls this, so it bounds steal reaction time.
+	StealCheckInterval = 0.1,
 }
 
 local PATH_PARAMS = {
@@ -311,7 +326,8 @@ local state = {
 	highlightEggs = true,
 	autoMount = false,
 	rideable = nil,
-	lastMount = 0,
+	-- Absolute os.clock() time the next auto-mount is due. 0 means now.
+	nextMountAt = 0,
 	eggsSinceGems = 0,
 	performance = false,
 	theme = "Default",
@@ -379,6 +395,7 @@ local waypointSlider
 local goalTimeoutSlider
 local eggStaySlider
 local eggStallSlider
+local eggSlowSlider
 local statusLabel
 
 ----------------------------------------------------------------------
@@ -638,6 +655,33 @@ local function countSteal(animal, value)
     return true
 end
 
+-- Failed attempts per animal, with the time of the last one. Weak keys so an
+-- animal that despawns does not keep its entry alive.
+local stealAttemptTimes = setmetatable({}, { __mode = "k" })
+
+local function noteStealFailure(animal)
+	state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
+	stealAttemptTimes[animal] = os.clock()
+end
+
+-- Attempts that have gone stale are forgiven, so a high-value animal is only
+-- benched for a while rather than for the whole session.
+local function stealAttemptCount(animal)
+	local count = state.stealAttempts[animal] or 0
+	if count == 0 then
+		return 0
+	end
+
+	local last = stealAttemptTimes[animal]
+	if last and os.clock() - last > (CONFIG.StealRetryAfter or 60) then
+		state.stealAttempts[animal] = nil
+		stealAttemptTimes[animal] = nil
+		return 0
+	end
+
+	return count
+end
+
 -- Highest earning hatched animal that meets the threshold and hasn't failed too many times
 local function findTargetAnimal()
 	local pickups = Workspace:FindFirstChild("AnimalPickups")
@@ -648,7 +692,7 @@ local function findTargetAnimal()
 	local best, bestValue = nil, -1
 	for _, animal in ipairs(pickups:GetChildren()) do
 		local value = readCashPerSecond(animal)
-		local attempts = state.stealAttempts[animal] or 0
+		local attempts = stealAttemptCount(animal)
 		if value and value >= state.minCps and value > bestValue and attempts < CONFIG.MaxStealAttempts then
 			best, bestValue = animal, value
 		end
@@ -817,10 +861,66 @@ local function directionBlocked(origin, direction, distance, ignore)
 	return false
 end
 
--- Sweep outward from dead ahead, alternating sides, so the heading we take is
--- the smallest deviation from the one we wanted that is actually clear.
-local AVOID_ANGLES = { 0, 18, -18, 36, -36, 55, -55, 75, -75, 95, -95 }
+-- Full 360-degree sweep. The old list stopped at +-95, so a wall wider than
+-- the character's field of view had no escape heading at all.
+local AVOID_MAGNITUDES = {}
+do
+	for angle = 15, 180, 15 do
+		AVOID_MAGNITUDES[#AVOID_MAGNITUDES + 1] = angle
+	end
+end
+
 local AVOID_LOOKAHEAD = 10 -- adjustable from the Movement tab
+
+local function rotateFlat(direction, degrees)
+	return CFrame.Angles(0, math.rad(degrees), 0) * direction
+end
+
+-- How far we can see before hitting something solid, used to compare how open
+-- each side of an obstacle is.
+local function freeDistance(origin, direction, maxDistance, ignore)
+	local params = makeProbeParams(ignore)
+	local shortest = maxDistance
+
+	for _, height in ipairs(PROBE_HEIGHTS) do
+		local from = origin + Vector3.new(0, height, 0)
+		local hit = castSolid(from, direction, maxDistance, params)
+		if hit then
+			local travelled = (hit.Position - from).Magnitude
+			if travelled < shortest then
+				shortest = travelled
+			end
+		end
+	end
+
+	return shortest
+end
+
+-- Which way to go around. Samples a fan either side and takes the side with
+-- more open space, rather than whichever angle happened to be tested first.
+local function chooseAvoidSide(root, desired, ignore)
+	local reach = AVOID_LOOKAHEAD * 3
+	local left, right = 0, 0
+
+	for _, angle in ipairs({ 40, 70, 100, 130 }) do
+		left = left + freeDistance(root.Position, rotateFlat(desired, angle), reach, ignore)
+		right = right + freeDistance(root.Position, rotateFlat(desired, -angle), reach, ignore)
+	end
+
+	return (left >= right) and 1 or -1
+end
+
+-- A long wall used to produce left-right oscillation: the heading was re-picked
+-- every tick as "the smallest clear deviation", both sides scored about the
+-- same, and noise flipped the choice. So a side is now chosen ONCE and held
+-- until the straight line to the target opens up - wall following rather than
+-- greedy steering.
+local avoid = { side = 0, since = 0 }
+local AVOID_COMMIT_MAX = 8
+
+local function releaseAvoidCommitment()
+	avoid.side = 0
+end
 
 -- Returns a clear direction to walk, or nil when every direction is blocked.
 local function clearHeading(root, targetPoint, char)
@@ -831,15 +931,45 @@ local function clearHeading(root, targetPoint, char)
 
 	local distance = math.min(AVOID_LOOKAHEAD, flatDistance(root.Position, targetPoint))
 	if distance < 2 then
+		releaseAvoidCommitment()
 		return desired
 	end
 
 	local ignore = buildIgnoreList(char)
 
-	for _, angle in ipairs(AVOID_ANGLES) do
-		local direction = CFrame.Angles(0, math.rad(angle), 0) * desired
-		if not directionBlocked(root.Position, direction, distance, ignore) then
-			return direction
+	-- Straight at the target is clear: drop any commitment and take it.
+	if not directionBlocked(root.Position, desired, distance, ignore) then
+		releaseAvoidCommitment()
+		return desired
+	end
+
+	local now = os.clock()
+
+	-- Commit to a side, and keep it. The timeout only exists so a genuinely
+	-- wrong choice (a dead end) is eventually reconsidered.
+	if avoid.side == 0 or now - avoid.since > AVOID_COMMIT_MAX then
+		avoid.side = chooseAvoidSide(root, desired, ignore)
+		avoid.since = now
+	end
+
+	-- Smallest turn toward the committed side that is clear. Because the side
+	-- is fixed, following a wall means this angle widens smoothly instead of
+	-- snapping across the target line and back.
+	for _, magnitude in ipairs(AVOID_MAGNITUDES) do
+		local candidate = rotateFlat(desired, magnitude * avoid.side)
+		if not directionBlocked(root.Position, candidate, distance, ignore) then
+			return candidate
+		end
+	end
+
+	-- Nothing open on that side at all: this is a dead end, so switch sides
+	-- and commit to the new one.
+	for _, magnitude in ipairs(AVOID_MAGNITUDES) do
+		local candidate = rotateFlat(desired, -magnitude * avoid.side)
+		if not directionBlocked(root.Position, candidate, distance, ignore) then
+			avoid.side = -avoid.side
+			avoid.since = now
+			return candidate
 		end
 	end
 
@@ -969,6 +1099,7 @@ local PATH_MAX_AGE = 3
 local PATH_GOAL_DRIFT = 3
 
 local function clearPathCache()
+	releaseAvoidCommitment()
 	if pathCache.connection then
 		pathCache.connection:Disconnect()
 		pathCache.connection = nil
@@ -1216,7 +1347,7 @@ end
 local targetCache = { animal = nil, time = 0 }
 
 local function findTargetAnimalCached()
-	if os.clock() - targetCache.time > 0.25 then
+	if os.clock() - targetCache.time > (CONFIG.StealCheckInterval or 0.1) then
 		targetCache.animal = findTargetAnimal()
 		targetCache.time = os.clock()
 	end
@@ -1226,6 +1357,20 @@ end
 -- Stop walking when we are free to grab a dropped/caught animal
 local function stopForSteal()
 	return not state.running or (not isCarrying() and findTargetAnimalCached() ~= nil)
+end
+
+-- An idle wait that gives way the instant there is something to steal. Every
+-- pause in the farm path should go through this rather than a bare task.wait,
+-- or that pause becomes a window where a valuable animal is ignored.
+local function waitUnlessSteal(seconds)
+	local deadline = os.clock() + seconds
+	while os.clock() < deadline do
+		if stopForSteal() then
+			return false
+		end
+		task.wait(CONFIG.PollRate)
+	end
+	return true
 end
 
 ----------------------------------------------------------------------
@@ -1312,7 +1457,9 @@ local function collectGems(radius, force)
 			-- Pickup is not instant, so allow a moment after arriving.
 			if gem.Parent and reached then
 				local deadline = os.clock() + CONFIG.GemPickupWait
-				while gem.Parent and os.clock() < deadline and state.running do
+				-- stopForGems, not just state.running: an animal appearing
+				-- during this wait has to win immediately.
+				while gem.Parent and os.clock() < deadline and not stopForGems() do
 					task.wait(CONFIG.PollRate)
 				end
 			end
@@ -1479,24 +1626,40 @@ end
 -- standing on an egg, and OFF for every kind of travel.
 local slowModeOn = false
 
+-- Recorded so the Movement tab can say whether the remote was ever found,
+-- rather than this failing silently.
+local slowModeRemoteStatus = "not checked"
+
 function setSlowMode(on)
 	on = on and true or false
 	if slowModeOn == on then
-		return
+		return true
 	end
 
 	local remote = ReplicatedStorage:FindFirstChild("SlowModeRemote")
-	if not remote or not remote:IsA("RemoteEvent") then
-		return
+	if not remote then
+		slowModeRemoteStatus = "ReplicatedStorage.SlowModeRemote not found"
+		return false
 	end
 
-	local ok = pcall(function()
-		remote:FireServer(on)
+	-- Do not assume RemoteEvent: an IsA check that guessed wrong would skip
+	-- the call and report nothing.
+	local ok, err = pcall(function()
+		if remote:IsA("RemoteFunction") then
+			remote:InvokeServer(on)
+		else
+			remote:FireServer(on)
+		end
 	end)
 
 	if ok then
 		slowModeOn = on
+		slowModeRemoteStatus = "working (" .. (on and "on" or "off") .. ")"
+	else
+		slowModeRemoteStatus = "call failed: " .. tostring(err)
 	end
+
+	return ok
 end
 
 ----------------------------------------------------------------------
@@ -1621,26 +1784,41 @@ local function mountRideable(name)
 		return false, tostring(err)
 	end
 
-	state.lastMount = os.clock()
 	return true
+end
+
+-- Mounts and schedules the next attempt in one place. Success waits a full
+-- interval; failure retries soon, so a mount that is not owned yet at load
+-- (backpack still replicating) does not cost five minutes.
+local function mountNow()
+	if not state.rideable then
+		return false, "no rideable selected"
+	end
+
+	local ok, err = mountRideable(state.rideable)
+
+	if ok then
+		state.nextMountAt = os.clock() + (CONFIG.MountInterval or 300)
+	else
+		state.nextMountAt = os.clock() + (CONFIG.MountRetry or 15)
+	end
+
+	return ok, err
 end
 
 -- Re-mounts on a timer because dismounting happens for all sorts of reasons
 -- (respawn, teleport, being hit) and there is no reliable mounted flag to read.
+-- Polls every second against an absolute due time. The old version slept 10s
+-- between checks and measured "due" as lastMount + interval with lastMount
+-- reset to 0, which really meant "once the executor has run for five minutes".
 task.spawn(function()
 	while true do
-		task.wait(10)
+		task.wait(1)
 
-		if state.autoMount and state.rideable then
-			local due = (state.lastMount or 0) + (CONFIG.MountInterval or 300)
-			if os.clock() >= due then
-				local ok, err = mountRideable(state.rideable)
-				if not ok then
-					-- Push the next attempt out so a missing mount does not
-					-- retry every ten seconds forever.
-					state.lastMount = os.clock()
-					warn("[Autofarm] Mount failed:", err)
-				end
+		if state.autoMount and state.rideable and os.clock() >= (state.nextMountAt or 0) then
+			local ok, err = mountNow()
+			if not ok then
+				warn("[Autofarm] Mount failed:", err)
 			end
 		end
 	end
@@ -1664,7 +1842,7 @@ local function stealAnimal(animal)
 
 	local arrived = goTo(animal, CONFIG.StealReach, stopAlways, CONFIG.PathGoalTimeout)
 	if not arrived or not state.running then
-		state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
+		noteStealFailure(animal)
 		return
 	end
 
@@ -1702,7 +1880,7 @@ local function stealAnimal(animal)
 		setSlowMode(false)
 		notify("Steal", "Picked up " .. animal.Name)
 	else
-		state.stealAttempts[animal] = (state.stealAttempts[animal] or 0) + 1
+		noteStealFailure(animal)
 	end
 end
 
@@ -1745,10 +1923,13 @@ local function breakEgg(egg)
 		-- a fresh approach every few frames.
 		local threshold = inPosition and CONFIG.EggStayRadius or CONFIG.EggReach
 
+		-- Covers the last stretch as well as standing on the egg, so the
+		-- character arrives at 16 speed and can actually settle. Gating this on
+		-- arrival was circular: it needed the precision it was there to give.
+		setSlowMode(distance <= CONFIG.EggSlowRadius)
+
 		if distance > threshold then
 			inPosition = false
-			-- Travel at full speed.
-			setSlowMode(false)
 			goTo(egg, CONFIG.EggReach, stopForSteal, CONFIG.PathGoalTimeout)
 		else
 			if not inPosition then
@@ -1757,10 +1938,6 @@ local function breakEgg(egg)
 				releaseMoveKeys()
 				clearPathCache()
 			end
-
-			-- On the egg: 16 walk speed stops the character sliding past it and
-			-- oscillating back, which full speed could not settle out of.
-			setSlowMode(true)
 
 			local hp = getEggHpText(egg)
 			if hp ~= lastHp then
@@ -1870,7 +2047,7 @@ local function farmZone()
 
 		if not zoneTarget then
 			setStatus("Waiting for " .. zone.Name .. " to load")
-			task.wait(1)
+			waitUnlessSteal(1)
 			return
 		end
 
@@ -1883,7 +2060,8 @@ local function farmZone()
 			if eggsFolder and #eggsFolder:GetChildren() > 0 then
 				break
 			end
-			task.wait(0.5)
+			-- PollRate rather than 0.5s so a steal is not kept waiting.
+			task.wait(CONFIG.PollRate)
 		end
 		return
 	end
@@ -1915,16 +2093,24 @@ local function farmZone()
 
 		-- Batched rather than after every egg: break a run of eggs, then do one
 		-- sweep. Fewer interruptions and a predictable cycle.
-		if state.gems and state.eggsSinceGems >= CONFIG.GemsEveryEggs then
-			state.eggsSinceGems = 0
+		-- Never start a sweep with an animal waiting; stealing goes first. And
+		-- only reset the counter once a sweep has actually run, otherwise an
+		-- interruption would throw away the progress toward the next one.
+		if state.gems and state.eggsSinceGems >= CONFIG.GemsEveryEggs and not stopForSteal() then
 			setSlowMode(false)
 			setStatus("Collecting gems")
 			collectGems(CONFIG.GemRadius)
+
+			if not stopForSteal() then
+				state.eggsSinceGems = 0
+			end
 		end
 	end
 
 	if next(state.selectedEggs) == nil then
-		task.wait(1)
+		-- With nothing to break, the farm is effectively waiting to steal, so
+		-- this must not delay noticing an animal.
+		waitUnlessSteal(1)
 		return
 	end
 
@@ -1982,6 +2168,17 @@ local function deliverAnimal()
 		local char = getCharacter()
 		if char and state.running and not isPickaxe(char:FindFirstChildOfClass("Tool")) then
 			setStatus("Could not re-equip pickaxe, retrying next cycle")
+		end
+
+		-- Securing the animal dismounts us, so get back on straight away rather
+		-- than walking to the next egg on foot until the interval comes round.
+		-- mountNow also restarts the interval from here.
+		if state.autoMount and state.rideable and state.running then
+			setStatus("Remounting " .. state.rideable)
+			local ok, err = mountNow()
+			if not ok then
+				warn("[Autofarm] Remount after delivery failed:", err)
+			end
 		end
 	end
 
@@ -2273,6 +2470,7 @@ local function collectConfig()
 		goalTimeout     = CONFIG.PathGoalTimeout,
 		eggStayRadius   = CONFIG.EggStayRadius,
 		eggStallTimeout = CONFIG.EggStallTimeout,
+		eggSlowRadius   = CONFIG.EggSlowRadius,
 		-- These counters are incremented live next to the session ones, so
 		-- they already include this run. Only runtime needs the session added,
 		-- because nothing advances it during play.
@@ -2435,6 +2633,9 @@ local function applyConfig(cfg)
 	end
 	if type(cfg.eggStallTimeout) == "number" then
 		restore(eggStallSlider, cfg.eggStallTimeout, function(v) CONFIG.EggStallTimeout = v end)
+	end
+	if type(cfg.eggSlowRadius) == "number" then
+		restore(eggSlowSlider, cfg.eggSlowRadius, function(v) CONFIG.EggSlowRadius = v end)
 	end
 
 	-- 3. Mounts.
@@ -3289,8 +3490,13 @@ rideableDropdown = MountTab:CreateDropdown({
 	Callback = function(option)
 		local name = type(option) == "table" and option[1] or option
 		state.rideable = name
-		-- Mount on the next tick rather than waiting out the interval.
-		state.lastMount = 0
+
+		-- Switching mounts with auto mount already on should take effect now.
+		-- Only when auto mount is on, so config restore (which sets the
+		-- rideable before the toggle) does not fire the remote twice.
+		if state.autoMount and name then
+			task.spawn(mountNow)
+		end
 		queueSave()
 	end,
 })
@@ -3311,8 +3517,14 @@ autoMountToggle = MountTab:CreateToggle({
 	Callback = function(value)
 		state.autoMount = value
 		if value then
-			-- Do not make the player wait five minutes to see it work.
-			state.lastMount = 0
+			-- Mount once immediately; mountNow then starts the interval from
+			-- this moment. Spawned so the toggle does not hang on the remote.
+			task.spawn(function()
+				local ok, err = mountNow()
+				if not ok then
+					notify("Mounts", "Could not mount yet: " .. tostring(err) .. ". Retrying shortly.")
+				end
+			end)
 		end
 		queueSave()
 	end,
@@ -3337,7 +3549,9 @@ MountTab:CreateButton({
 	Name = "Mount now",
 	Callback = function()
 		task.spawn(function()
-			local ok, err = mountRideable(state.rideable)
+			-- mountNow, not mountRideable, so a manual mount restarts the
+			-- interval instead of auto mount firing again moments later.
+			local ok, err = mountNow()
 			notify("Mounts", ok and ("Mounted " .. tostring(state.rideable)) or ("Failed: " .. tostring(err)))
 		end)
 	end,
@@ -3413,6 +3627,19 @@ eggStaySlider = MoveTab:CreateSlider({
 	end,
 })
 
+eggSlowSlider = MoveTab:CreateSlider({
+	Name = "Slow mode within",
+	Range = { 4, 60 },
+	Increment = 2,
+	Suffix = " studs",
+	CurrentValue = CONFIG.EggSlowRadius,
+	Flag = "EggSlowRadius",
+	Callback = function(value)
+		CONFIG.EggSlowRadius = value
+		queueSave()
+	end,
+})
+
 eggStallSlider = MoveTab:CreateSlider({
 	Name = "Abandon an egg taking no damage after",
 	Range = { 2, 20 },
@@ -3440,6 +3667,11 @@ highlightToggle = MoveTab:CreateToggle({
 		end
 		queueSave()
 	end,
+})
+
+local slowModeParagraph = MoveTab:CreateParagraph({
+	Title = "Slow mode",
+	Content = "Checking...",
 })
 
 MoveTab:CreateParagraph({
@@ -3762,6 +3994,16 @@ task.spawn(function()
 			})
 
 			pcall(function()
+				slowModeParagraph:Set({
+					Title = "Slow mode",
+					Content = string.format("Remote: %s\nCurrently: %s\nEngages within %d studs of the target egg.",
+						slowModeRemoteStatus,
+						slowModeOn and "ON" or "off",
+						CONFIG.EggSlowRadius),
+				})
+			end)
+
+			pcall(function()
 				gemProgressLabel:Set(string.format("Eggs since last sweep: %d / %d",
 					state.eggsSinceGems, CONFIG.GemsEveryEggs), "gem")
 			end)
@@ -3770,10 +4012,13 @@ task.spawn(function()
 				local owned = state.rideable and ownsRideable(state.rideable)
 				mountStatus:Set({
 					Title = "Status",
-					Content = string.format("Selected: %s\nOwned: %s\nAuto mount: %s",
+					Content = string.format("Selected: %s\nOwned: %s\nAuto mount: %s\nNext mount: %s",
 						state.rideable or "none",
 						state.rideable and (owned and "yes" or "not in your backpack") or "-",
-						state.autoMount and "on" or "off"),
+						state.autoMount and "on" or "off",
+						(state.autoMount and state.rideable)
+							and string.format("in %ds", math.max(0, math.ceil((state.nextMountAt or 0) - os.clock())))
+							or "-"),
 				})
 			end)
 
