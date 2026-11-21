@@ -47,6 +47,13 @@ local CONFIG = {
 	-- within 1.5 studs - which at full speed it could never do, so slow mode
 	-- never came on at all.
 	EggSlowRadius = 18,
+	-- After an HP drop, the egg still counts as "being damaged" for this long.
+	-- Auto swing hits in pulses, so this has to outlast the gap between hits or
+	-- the character would start walking again between every swing.
+	EggDamageGrace = 1.5,
+	-- Walk speed slow mode puts the character at (Roblox's default). Used to
+	-- check slow mode is really on, since the game can reset it by itself.
+	SlowWalkSpeed = 16,
 	GemsEveryEggs = 10,
 	-- How often auto-mount re-fires the ride remote.
 	MountInterval = 300,
@@ -725,6 +732,21 @@ local function getEggHpText(egg)
 		return text
 	end
 	return nil
+end
+
+-- Current HP as a number, from text like "1.2K/1.3Qa HP". The old checks only
+-- compared the raw text, which cannot tell damage apart from any other change
+-- to the label; a numeric drop is unambiguous.
+local function readEggHp(egg)
+	local text = getEggHpText(egg)
+	if not text then
+		return nil
+	end
+	local current = text:match("^%s*([^/]+)/")
+	if not current then
+		return nil
+	end
+	return parseMoney((current:gsub("%s", "")))
 end
 
 -- HP text looks like "0/1.3Qa HP" when broken. Once an egg breaks its HP text is removed, so missing text also means broken.
@@ -1609,10 +1631,35 @@ local slowModeOn = false
 -- rather than this failing silently.
 local slowModeRemoteStatus = "not checked"
 
+local lastSlowVerify = 0
+
+-- True when the character is actually moving at slow-mode speed.
+local function slowModeActive()
+	local _, hum = getCharacter()
+	if not hum then
+		return nil
+	end
+	return hum.WalkSpeed <= (CONFIG.SlowWalkSpeed or 16) + 1
+end
+
 function setSlowMode(on)
 	on = on and true or false
+
 	if slowModeOn == on then
-		return true
+		-- The cache alone is not trustworthy: the game can drop slow mode on
+		-- its own (respawn, mounting), and trusting "already on" meant it was
+		-- never sent again. While it should be on, check the real walk speed
+		-- and re-send if it has been reset. Throttled so a mount whose speed
+		-- slow mode cannot change does not spam the remote.
+		if not on or os.clock() - lastSlowVerify < 0.5 then
+			return true
+		end
+		lastSlowVerify = os.clock()
+
+		if slowModeActive() ~= false then
+			return true
+		end
+		-- Fall through and send it again.
 	end
 
 	local remote = ReplicatedStorage:FindFirstChild("SlowModeRemote")
@@ -1870,13 +1917,64 @@ local function breakEgg(egg)
 
 	local startTime = os.clock()
 
-	-- Auto swing damages whatever is in front of us, so once we are on the egg
-	-- the right thing to do is stand still. Chasing its exact centre is what
-	-- produced the left-right jitter.
+	-- Auto swing damages whatever is in front of us, so the moment the egg
+	-- starts losing HP we are close enough. Stopping on DAMAGE rather than on
+	-- reaching EggReach is what ends the shuffle: hits were landing several
+	-- studs out while the approach kept pushing toward 1.5 studs.
 	local inPosition = false
-	local lastHp = getEggHpText(egg)
-	local lastHpChange = os.clock()
+	local lastHpValue = readEggHp(egg)
+	local lastDamageAt = 0
+	local inPositionSince = 0
 	local stallRecoveries = 0
+	local lastDamageCheck = 0
+	local damagingCache = false
+
+	-- Throttled: this runs as goTo's stop condition, which is polled every
+	-- frame, and the HP label lookup is a recursive search.
+	local function isDamaging()
+		local now = os.clock()
+		if now - lastDamageCheck >= 0.1 then
+			lastDamageCheck = now
+
+			local hp = readEggHp(egg)
+			if hp and lastHpValue and hp < lastHpValue then
+				lastDamageAt = now
+				stallRecoveries = 0
+			end
+			if hp then
+				lastHpValue = hp
+			end
+
+			damagingCache = lastDamageAt > 0 and now - lastDamageAt < CONFIG.EggDamageGrace
+		end
+		return damagingCache
+	end
+
+	-- goTo is blocking and polls this every frame of the walk, which makes it
+	-- the one place that sees the distance change as the character moves.
+	-- Slow mode used to be decided once before the walk started, so an egg
+	-- that began outside the radius was approached at full speed all the way
+	-- in, regardless of the radius.
+	local function stopApproach()
+		local damaging = isDamaging()
+
+		local _, _, r = getCharacter()
+		local pos = getPosition(egg)
+		if r and pos then
+			setSlowMode(damaging or flatDistance(r.Position, pos) <= CONFIG.EggSlowRadius)
+		end
+
+		return stopForSteal() or damaging
+	end
+
+	local function settle()
+		if not inPosition then
+			inPosition = true
+			inPositionSince = os.clock()
+			releaseMoveKeys()
+			clearPathCache()
+		end
+	end
 
 	while state.running and egg.Parent and not isEggBroken(egg) do
 		if stopForSteal() or os.clock() - startTime > CONFIG.EggTimeout then
@@ -1898,47 +1996,45 @@ local function breakEgg(egg)
 		highlightEgg(egg)
 
 		local distance = flatDistance(root.Position, eggPosition)
-		-- Wider radius to stay than to arrive, so small drift does not trigger
-		-- a fresh approach every few frames.
-		local threshold = inPosition and CONFIG.EggStayRadius or CONFIG.EggReach
 
-		-- Covers the last stretch as well as standing on the egg, so the
-		-- character arrives at 16 speed and can actually settle. Gating this on
-		-- arrival was circular: it needed the precision it was there to give.
-		setSlowMode(distance <= CONFIG.EggSlowRadius)
-
-		if distance > threshold then
-			inPosition = false
-			goTo(egg, CONFIG.EggReach, stopForSteal, CONFIG.PathGoalTimeout)
-		else
-			if not inPosition then
-				inPosition = true
-				-- Stop walking and drop the route; we are here and swinging.
-				releaseMoveKeys()
-				clearPathCache()
-			end
-
-			local hp = getEggHpText(egg)
-			if hp ~= lastHp then
-				lastHp = hp
-				lastHpChange = os.clock()
-				stallRecoveries = 0
-			elseif os.clock() - lastHpChange > CONFIG.EggStallTimeout then
-				if stallRecoveries < 1 then
-					-- Possibly just outside swing range after drifting to the
-					-- edge of the stay radius. Close in once before writing
-					-- the egg off, so a nearly-broken one is not abandoned.
-					stallRecoveries += 1
-					lastHpChange = os.clock()
-					inPosition = false
-				else
-					-- Still nothing happening. Move on rather than waiting out
-					-- EggTimeout.
-					break
-				end
-			end
-
+		if isDamaging() then
+			-- Hitting it: stop dead, slow mode on, and do not move again until
+			-- the hits stop. Distance is irrelevant here - landing hits proves
+			-- we are in range.
+			settle()
+			setSlowMode(true)
 			task.wait(CONFIG.PollRate)
+		else
+			-- Not hitting yet. Slow mode also covers the final approach so the
+			-- first hit lands without overshooting.
+			setSlowMode(distance <= CONFIG.EggSlowRadius)
+
+			-- Wider radius to stay than to arrive, so small drift does not
+			-- trigger a fresh approach every few frames.
+			local threshold = inPosition and CONFIG.EggStayRadius or CONFIG.EggReach
+
+			if distance > threshold then
+				inPosition = false
+				goTo(egg, CONFIG.EggReach, stopApproach, CONFIG.PathGoalTimeout)
+			else
+				settle()
+
+				-- In position but no damage registering. Give it a moment, close
+				-- in once in case we are just outside swing range, then give up
+				-- rather than standing here until EggTimeout.
+				local quietSince = math.max(lastDamageAt, inPositionSince)
+				if os.clock() - quietSince > CONFIG.EggStallTimeout then
+					if stallRecoveries < 1 then
+						stallRecoveries += 1
+						inPosition = false
+						inPositionSince = os.clock()
+					else
+						break
+					end
+				end
+
+				task.wait(CONFIG.PollRate)
+			end
 		end
 	end
 
@@ -2450,6 +2546,7 @@ local function collectConfig()
 		eggStayRadius   = CONFIG.EggStayRadius,
 		eggStallTimeout = CONFIG.EggStallTimeout,
 		eggSlowRadius   = CONFIG.EggSlowRadius,
+		eggDamageGrace  = CONFIG.EggDamageGrace,
 		-- These counters are incremented live next to the session ones, so
 		-- they already include this run. Only runtime needs the session added,
 		-- because nothing advances it during play.
@@ -2615,6 +2712,9 @@ local function applyConfig(cfg)
 	end
 	if type(cfg.eggSlowRadius) == "number" then
 		restore(UI.eggSlowSlider, cfg.eggSlowRadius, function(v) CONFIG.EggSlowRadius = v end)
+	end
+	if type(cfg.eggDamageGrace) == "number" then
+		restore(UI.eggDamageGraceSlider, cfg.eggDamageGrace, function(v) CONFIG.EggDamageGrace = v end)
 	end
 
 	-- 3. Mounts.
@@ -3619,6 +3719,19 @@ UI.eggSlowSlider = UI.MoveTab:CreateSlider({
 	end,
 })
 
+UI.eggDamageGraceSlider = UI.MoveTab:CreateSlider({
+	Name = "Hold position after a hit for",
+	Range = { 0.5, 5 },
+	Increment = 0.5,
+	Suffix = " s",
+	CurrentValue = CONFIG.EggDamageGrace,
+	Flag = "EggDamageGrace",
+	Callback = function(value)
+		CONFIG.EggDamageGrace = value
+		queueSave()
+	end,
+})
+
 UI.eggStallSlider = UI.MoveTab:CreateSlider({
 	Name = "Abandon an egg taking no damage after",
 	Range = { 2, 20 },
@@ -3973,11 +4086,15 @@ task.spawn(function()
 			})
 
 			pcall(function()
+				-- Show the real walk speed next to what the script believes, so a
+				-- game-side reset of slow mode is visible rather than hidden.
+				local _, hum = getCharacter()
 				UI.slowModeParagraph:Set({
 					Title = "Slow mode",
-					Content = string.format("Remote: %s\nCurrently: %s\nEngages within %d studs of the target egg.",
+					Content = string.format("Remote: %s\nScript wants: %s\nActual walk speed: %s\nEngages within %d studs of the target egg.",
 						slowModeRemoteStatus,
 						slowModeOn and "ON" or "off",
+						hum and string.format("%.1f", hum.WalkSpeed) or "?",
 						CONFIG.EggSlowRadius),
 				})
 			end)
