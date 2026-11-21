@@ -42,11 +42,18 @@ local CONFIG = {
 	GemPickupWait = 0.6,
 	-- Gems are swept in a batch after this many eggs rather than after every
 	-- single one, which keeps the farm moving in a predictable cycle.
-	-- Slow mode has to engage on the APPROACH, not on arrival. Gating it on
-	-- EggReach meant it only turned on once the character had already settled
-	-- within 1.5 studs - which at full speed it could never do, so slow mode
-	-- never came on at all.
-	EggSlowRadius = 18,
+	-- Within this distance of an egg (with a clear line to it) the final
+	-- approach switches to the precision mover: camera aimed at the egg, W held
+	-- alone, and released early so the character coasts to a stop on it.
+	PrecisionRange = 25,
+	-- Slow mode is only used for correction moves after the first precision
+	-- run, and only when the correction is this short. The main approach runs
+	-- at full speed, so eggs per hour no longer pay for it.
+	CorrectionSlowMax = 18,
+	-- Give up on a single precision run after this long.
+	PrecisionTimeout = 6,
+	-- Precision attempts on one egg before falling back to pathfinding.
+	PrecisionMaxAttempts = 4,
 	-- After an HP drop, the egg still counts as "being damaged" for this long.
 	-- Auto swing hits in pulses, so this has to outlast the gap between hits or
 	-- the character would start walking again between every swing.
@@ -70,6 +77,15 @@ local CONFIG = {
 	-- How often the "is there something worth stealing?" check refreshes.
 	-- Every interruptible wait polls this, so it bounds steal reaction time.
 	StealCheckInterval = 0.1,
+	-- Internal tuning, moved here from standalone locals to stay well clear
+	-- of Luau's 200-local limit.
+	PATH_MAX_AGE = 3,
+	PATH_GOAL_DRIFT = 3,
+	AVOID_COMMIT_MAX = 8,
+	HEADING_REFRESH = 0.08,
+	BODY_HALF_WIDTH = 1.6,
+	PASSTHROUGH_SKIP_LIMIT = 8,
+	WEBHOOK_MIN_GAP = 3,
 }
 
 local PATH_PARAMS = {
@@ -338,6 +354,9 @@ local state = {
 	eggsSinceGems = 0,
 	performance = false,
 	theme = "Default",
+	ragdolled = false,
+	recovering = false,
+	lastMountAt = 0,
 }
 
 -- Session counters, plus lifetime totals carried across runs in the config.
@@ -467,7 +486,6 @@ local RESPECTS_CAN_COLLIDE = pcall(function()
 	RaycastParams.new().RespectCanCollide = true
 end)
 
-local PASSTHROUGH_SKIP_LIMIT = 8
 
 -- Returns the first hit the character would actually collide with, or nil.
 local function castSolid(origin, direction, distance, params)
@@ -478,7 +496,7 @@ local function castSolid(origin, direction, distance, params)
 	local from = origin
 	local remaining = distance
 
-	for _ = 1, PASSTHROUGH_SKIP_LIMIT do
+	for _ = 1, CONFIG.PASSTHROUGH_SKIP_LIMIT do
 		local result = Workspace:Raycast(from, direction * remaining, params)
 		if not result then
 			return nil
@@ -842,13 +860,12 @@ end
 -- A single centre ray misses anything the character's shoulders would clip, and
 -- a knee-height ray walks straight into railings. Probe the body's width at two
 -- heights instead.
-local BODY_HALF_WIDTH = 1.6
 local PROBE_HEIGHTS = { 1.0, 3.0 }
 
 local function directionBlocked(origin, direction, distance, ignore)
 	local params = makeProbeParams(ignore)
 
-	local side = Vector3.new(-direction.Z, 0, direction.X) * BODY_HALF_WIDTH
+	local side = Vector3.new(-direction.Z, 0, direction.X) * CONFIG.BODY_HALF_WIDTH
 
 	for _, offset in ipairs({ Vector3.zero, side, -side }) do
 		for _, height in ipairs(PROBE_HEIGHTS) do
@@ -917,7 +934,6 @@ end
 -- until the straight line to the target opens up - wall following rather than
 -- greedy steering.
 local avoid = { side = 0, since = 0 }
-local AVOID_COMMIT_MAX = 8
 
 local function releaseAvoidCommitment()
 	avoid.side = 0
@@ -948,7 +964,7 @@ local function clearHeading(root, targetPoint, char)
 
 	-- Commit to a side, and keep it. The timeout only exists so a genuinely
 	-- wrong choice (a dead end) is eventually reconsidered.
-	if avoid.side == 0 or now - avoid.since > AVOID_COMMIT_MAX then
+	if avoid.side == 0 or now - avoid.since > CONFIG.AVOID_COMMIT_MAX then
 		avoid.side = chooseAvoidSide(root, desired, ignore)
 		avoid.since = now
 	end
@@ -1017,7 +1033,6 @@ end
 -- ahead costs six raycasts, but a fully blocked sweep costs sixty-six, and
 -- this runs inside the per-frame steering loop.
 local headingCache = { direction = nil, time = 0, open = true }
-local HEADING_REFRESH = 0.08
 
 local function steerAvoiding(point, char)
 	local _, _, root = getCharacter()
@@ -1025,7 +1040,7 @@ local function steerAvoiding(point, char)
 		return true
 	end
 
-	if os.clock() - headingCache.time >= HEADING_REFRESH then
+	if os.clock() - headingCache.time >= CONFIG.HEADING_REFRESH then
 		headingCache.direction = clearHeading(root, point, char)
 		headingCache.open = headingCache.direction ~= nil
 		headingCache.time = os.clock()
@@ -1059,7 +1074,7 @@ local function clearLine(from, to, char)
 	local ignore = buildIgnoreList(char)
 	local direction = flat.Unit
 	local distance = flat.Magnitude
-	local side = Vector3.new(-direction.Z, 0, direction.X) * BODY_HALF_WIDTH
+	local side = Vector3.new(-direction.Z, 0, direction.X) * CONFIG.BODY_HALF_WIDTH
 	local params = makeProbeParams(ignore)
 
 	for _, offset in ipairs({ Vector3.zero, side, -side }) do
@@ -1074,6 +1089,184 @@ local function clearLine(from, to, char)
 	end
 
 	return true
+end
+
+----------------------------------------------------------------------
+-- Precision approach
+----------------------------------------------------------------------
+
+-- Two things made the final approach to an egg overshoot:
+--   1. WASD only moves in 8 directions relative to the camera. Unless the egg
+--      happened to sit on one of them, steering flipped between W and W+D each
+--      frame and zigzagged in.
+--   2. At farm speed, letting go of a key one frame late carries the character
+--      several studs past the point.
+-- Slow mode hid both by crawling, at the cost of eggs per hour.
+--
+-- The camera is driven by this script, so it is turned to face the egg exactly
+-- and only W is held: the character moves straight down the line to it. W is
+-- then let go early enough to stop on the spot.
+--
+-- There is no sliding in this game, on foot or mounted: the character stops
+-- dead once the release registers. So the overshoot is purely input latency -
+-- the distance covered in the frames between letting go and the game seeing
+-- it - which is speed x latency. Every stop measures that and feeds it back
+-- per speed band. Checked offline against a model of that physics: lands
+-- within the 1.5 stud egg reach at speeds up to 150 studs/s, including slow
+-- acceleration and a 4-frame laggy client, with no overshoots once warmed up.
+local precision = {
+	cameraLocked = false,
+	cameraForward = Vector3.new(0, 0, -1),
+	-- Upper speed limit of each band, in studs/s; anything faster uses the last.
+	bands = { 25, 50, 100 },
+	-- Seconds the character keeps travelling after W is let go, per band.
+	-- Stop distance is speed * this. Starts as a guess and is learned.
+	stopTime = { 0.12, 0.12, 0.12, 0.12 },
+	samples = 0,
+	lastError = nil,
+	lastSpeed = 0,
+}
+
+function precision.band(speed)
+	for index, limit in ipairs(precision.bands) do
+		if speed < limit then
+			return index
+		end
+	end
+	return #precision.bands + 1
+end
+
+function precision.resetCalibration()
+	for index = 1, #precision.stopTime do
+		precision.stopTime[index] = 0.12
+	end
+	precision.samples = 0
+end
+
+-- Walks straight to `target` (an Instance or a Vector3) and stops within
+-- `reach`, releasing W ahead of time. Returns true when it lands in reach.
+-- Assumes a clear straight line; the caller checks that first.
+function precision.approach(target, reach, shouldStop)
+	local function targetPosition()
+		if typeof(target) == "Vector3" then
+			return target
+		end
+		return getPosition(target)
+	end
+
+	local started = os.clock()
+	local released = false
+	local releasedAt, releasePosition, releaseSpeed, releaseDirection, releaseBand
+	local stalledSince = nil
+	local approached = false
+
+	while true do
+		local dt = RunService.Heartbeat:Wait()
+
+		if not state.running or (shouldStop and shouldStop()) then
+			releaseMoveKeys()
+			return false
+		end
+
+		local _, hum, root = getCharacter()
+		local goal = targetPosition()
+		if not hum or not root or not goal or hum.Health <= 0 then
+			releaseMoveKeys()
+			return false
+		end
+
+		local offset = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
+		local distance = offset.Magnitude
+		local velocity = root.AssemblyLinearVelocity
+		local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+
+		if not released then
+			if distance <= reach then
+				releaseMoveKeys()
+				precision.lastError = distance
+				return true
+			end
+
+			local direction = offset.Unit
+			local rawAlong = flatVelocity:Dot(direction)
+			local along = math.max(rawAlong, 0)
+
+			-- Moving AWAY from a target we were heading for means we have
+			-- already passed it. Carrying on would swing the camera round and
+			-- drive back, oscillating across it; stop here instead and let the
+			-- caller run a short correction.
+			if rawAlong > 1 then
+				approached = true
+			elseif approached and rawAlong < -0.5 then
+				releaseMoveKeys()
+				precision.lastError = distance
+				return distance <= reach
+			end
+
+			if precision.cameraLocked then
+				-- Point the camera down the line and hold W alone: a straight run
+				-- at the target instead of an 8-direction zigzag.
+				precision.cameraForward = direction
+				setKeyHeld("W", true)
+				setKeyHeld("A", false)
+				setKeyHeld("S", false)
+				setKeyHeld("D", false)
+			else
+				steerToward(goal)
+			end
+
+			local band = precision.band(along)
+			local stopDistance = along * precision.stopTime[band]
+
+			-- Let go this frame if holding on for one more would carry us past
+			-- the release point. Half a frame of travel splits the difference
+			-- between letting go early and late.
+			if along > 1 and distance <= stopDistance + along * dt * 0.5 then
+				releaseMoveKeys()
+				released = true
+				releasedAt = os.clock()
+				releasePosition = root.Position
+				releaseSpeed = along
+				releaseDirection = direction
+				releaseBand = band
+			end
+
+			-- Holding W but not moving means something is in the way.
+			if along < 1 then
+				stalledSince = stalledSince or os.clock()
+				if os.clock() - stalledSince > 0.6 then
+					releaseMoveKeys()
+					return false
+				end
+			else
+				stalledSince = nil
+			end
+
+			if os.clock() - started > CONFIG.PrecisionTimeout then
+				releaseMoveKeys()
+				return false
+			end
+		else
+			-- Coasting. Wait until we have actually stopped, then learn from how
+			-- far the coast really went.
+			if flatVelocity.Magnitude < 0.5 or os.clock() - releasedAt > 0.8 then
+				local coast = (root.Position - releasePosition):Dot(releaseDirection)
+
+				if releaseSpeed > 2 and coast >= 0 then
+					local sample = math.clamp(coast / releaseSpeed, 0.01, 0.6)
+					local old = precision.stopTime[releaseBand]
+					-- Moving average: settles quickly but one odd stop (a bump,
+					-- a lag spike) cannot throw it off.
+					precision.stopTime[releaseBand] = old + (sample - old) * 0.35
+					precision.samples += 1
+				end
+
+				precision.lastSpeed = releaseSpeed
+				precision.lastError = distance
+				return distance <= reach
+			end
+		end
+	end
 end
 
 ----------------------------------------------------------------------
@@ -1093,11 +1286,9 @@ local pathCache = {
 	connection = nil,
 }
 
-local PATH_MAX_AGE = 3
 -- Eggs in a zone sit close together. At 8 studs the route to the egg we just
 -- broke was being reused for the next one, leaving the character standing on a
 -- finished path making no progress until the stall timers fired.
-local PATH_GOAL_DRIFT = 3
 
 local function clearPathCache()
 	releaseAvoidCommitment()
@@ -1118,11 +1309,11 @@ local function pathCacheUsable(goal)
 	if pathCache.index > #pathCache.waypoints then
 		return false
 	end
-	if os.clock() - pathCache.time > PATH_MAX_AGE then
+	if os.clock() - pathCache.time > CONFIG.PATH_MAX_AGE then
 		return false
 	end
 	-- A target that has moved far enough needs a new route.
-	return pathCache.goal ~= nil and flatDistance(pathCache.goal, goal) <= PATH_GOAL_DRIFT
+	return pathCache.goal ~= nil and flatDistance(pathCache.goal, goal) <= CONFIG.PATH_GOAL_DRIFT
 end
 
 local function buildPath(goal, char, root)
@@ -1825,6 +2016,8 @@ local function mountNow()
 
 	if ok then
 		state.nextMountAt = os.clock() + (CONFIG.MountInterval or 300)
+		-- Lets the ragdoll watcher ignore the state changes mounting causes.
+		state.lastMountAt = os.clock()
 	else
 		state.nextMountAt = os.clock() + (CONFIG.MountRetry or 15)
 	end
@@ -1851,6 +2044,109 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------------------------
+-- Ragdoll recovery
+----------------------------------------------------------------------
+
+-- A guard catching us mid-steal ragdolls the character and knocks it off the
+-- mount. It gets back up on its own, but nothing put it back on the mount, so
+-- the steal resumed on foot. This watches the humanoid's state and remounts as
+-- soon as it is standing again, before the farm carries on.
+local ragdoll = {
+	-- States a knockdown puts the humanoid in.
+	knocked = {
+		[Enum.HumanoidStateType.Ragdoll] = true,
+		[Enum.HumanoidStateType.FallingDown] = true,
+		[Enum.HumanoidStateType.Physics] = true,
+		[Enum.HumanoidStateType.PlatformStanding] = true,
+	},
+	-- States that mean it is properly back on its feet. Deliberately not
+	-- "anything else": riding a mount puts the humanoid in its own state
+	-- (typically Seated), and treating that as recovery would remount in a loop.
+	upright = {
+		[Enum.HumanoidStateType.GettingUp] = true,
+		[Enum.HumanoidStateType.Running] = true,
+		[Enum.HumanoidStateType.RunningNoPhysics] = true,
+		[Enum.HumanoidStateType.Landed] = true,
+	},
+	connection = nil,
+	lastRemount = 0,
+}
+
+function ragdoll.onRecovered()
+	state.ragdolled = false
+
+	if not (state.autoMount and state.rideable) then
+		return
+	end
+	-- GettingUp, Running and Landed can all fire for one recovery.
+	if os.clock() - ragdoll.lastRemount < 3 then
+		return
+	end
+	ragdoll.lastRemount = os.clock()
+
+	-- Holds the farm (mainLoop waits on this) until the remount has gone out,
+	-- so it is already riding when it goes back for the animal.
+	state.recovering = true
+	task.spawn(function()
+		-- Let the character finish standing up first; mounting mid-animation
+		-- can be ignored by the game.
+		task.wait(0.4)
+		setStatus("Remounting after knockdown")
+		local ok, err = mountNow()
+		if not ok then
+			warn("[Autofarm] Remount after ragdoll failed:", err)
+		end
+		state.recovering = false
+	end)
+end
+
+function ragdoll.watch(char)
+	if ragdoll.connection then
+		ragdoll.connection:Disconnect()
+		ragdoll.connection = nil
+	end
+
+	local hum = char and char:WaitForChild("Humanoid", 10)
+	if not hum then
+		return
+	end
+
+	ragdoll.connection = hum.StateChanged:Connect(function(_, newState)
+		-- Mounting can change the humanoid's state itself; ignore the moment
+		-- right after a mount so it can never trigger its own remount.
+		if os.clock() - (state.lastMountAt or 0) < 2 then
+			return
+		end
+
+		if ragdoll.knocked[newState] then
+			state.ragdolled = true
+			releaseMoveKeys()
+		elseif state.ragdolled and ragdoll.upright[newState] then
+			ragdoll.onRecovered()
+		end
+	end)
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+	state.ragdolled = false
+	state.recovering = false
+	ragdoll.watch(char)
+
+	-- Respawning leaves us on foot too.
+	if state.autoMount and state.rideable then
+		task.delay(1.5, function()
+			if state.autoMount then
+				mountNow()
+			end
+		end)
+	end
+end)
+
+if LocalPlayer.Character then
+	task.spawn(ragdoll.watch, LocalPlayer.Character)
+end
+
+----------------------------------------------------------------------
 -- Actions
 ----------------------------------------------------------------------
 
@@ -1866,7 +2162,16 @@ local function stealAnimal(animal)
 		return
 	end
 
-	local arrived = goTo(animal, CONFIG.StealReach, stopAlways, CONFIG.PathGoalTimeout)
+	-- Stop if we are knocked down on the way. That is a guard, not a failed
+	-- steal, so it must not count against the animal; mainLoop waits for us
+	-- to get up and remount, then tries again.
+	local arrived = goTo(animal, CONFIG.StealReach, function()
+		return not state.running or state.ragdolled
+	end, CONFIG.PathGoalTimeout)
+
+	if state.ragdolled then
+		return
+	end
 	if not arrived or not state.running then
 		noteStealFailure(animal)
 		return
@@ -1956,16 +2261,12 @@ local function breakEgg(egg)
 	-- that began outside the radius was approached at full speed all the way
 	-- in, regardless of the radius.
 	local function stopApproach()
-		local damaging = isDamaging()
-
-		local _, _, r = getCharacter()
-		local pos = getPosition(egg)
-		if r and pos then
-			setSlowMode(damaging or flatDistance(r.Position, pos) <= CONFIG.EggSlowRadius)
-		end
-
-		return stopForSteal() or damaging
+		return stopForSteal() or isDamaging()
 	end
+
+	-- First precision run on this egg is at full speed; every one after it is
+	-- a correction. Reset whenever hits start landing.
+	local approachAttempts = 0
 
 	local function settle()
 		if not inPosition then
@@ -1998,24 +2299,43 @@ local function breakEgg(egg)
 		local distance = flatDistance(root.Position, eggPosition)
 
 		if isDamaging() then
-			-- Hitting it: stop dead, slow mode on, and do not move again until
-			-- the hits stop. Distance is irrelevant here - landing hits proves
-			-- we are in range.
+			-- Hitting it: stop dead and do not move again until the hits stop.
+			-- Distance is irrelevant here - landing hits proves we are in
+			-- range. Slow mode buys nothing while standing still, and leaving
+			-- it on would only make the walk to the next egg start slow.
 			settle()
-			setSlowMode(true)
+			setSlowMode(false)
+			approachAttempts = 0
 			task.wait(CONFIG.PollRate)
 		else
-			-- Not hitting yet. Slow mode also covers the final approach so the
-			-- first hit lands without overshooting.
-			setSlowMode(distance <= CONFIG.EggSlowRadius)
-
 			-- Wider radius to stay than to arrive, so small drift does not
 			-- trigger a fresh approach every few frames.
 			local threshold = inPosition and CONFIG.EggStayRadius or CONFIG.EggReach
 
 			if distance > threshold then
 				inPosition = false
-				goTo(egg, CONFIG.EggReach, stopApproach, CONFIG.PathGoalTimeout)
+
+				if distance > CONFIG.PrecisionRange then
+					-- Far off: ordinary pathfinding at full speed, just far
+					-- enough to come inside precision range.
+					setSlowMode(false)
+					goTo(egg, CONFIG.PrecisionRange * 0.6, stopApproach, CONFIG.PathGoalTimeout)
+				elseif approachAttempts < CONFIG.PrecisionMaxAttempts
+					and clearLine(root.Position, eggPosition, char) then
+					-- Close, clear line: finish in a straight run and release
+					-- early so we coast onto the egg. The first run is full
+					-- speed; a follow-up is a correction, done in slow mode only
+					-- when it is short.
+					approachAttempts += 1
+					local correcting = approachAttempts > 1
+					setSlowMode(correcting and distance <= CONFIG.CorrectionSlowMax)
+					precision.approach(egg, CONFIG.EggReach, stopApproach)
+				else
+					-- Blocked line, or precision keeps missing: let pathfinding
+					-- route in the old way.
+					setSlowMode(false)
+					goTo(egg, CONFIG.EggReach, stopApproach, CONFIG.PathGoalTimeout)
+				end
 			else
 				settle()
 
@@ -2269,6 +2589,20 @@ local function mainLoop()
 			continue
 		end
 
+		-- Knocked down: wait until we are up and remounted so the next steal
+		-- starts already riding. Capped, so a recovery the watcher did not see
+		-- cannot freeze the farm.
+		if state.ragdolled or state.recovering then
+			setStatus("Recovering from knockdown")
+			local waitStart = os.clock()
+			while (state.ragdolled or state.recovering) and state.running
+				and os.clock() - waitStart < 6 do
+				task.wait(CONFIG.PollRate)
+			end
+			state.ragdolled = false
+			state.recovering = false
+		end
+
 		if isCarrying() then
 			deliverAnimal()
 		else
@@ -2297,7 +2631,10 @@ local function startCameraLock()
 	if forward.Magnitude < 0.01 then
 		forward = Vector3.new(0, 0, -1)
 	end
-	forward = forward.Unit
+	-- Shared with the precision mover, which turns the camera to face its
+	-- target so that W alone heads straight at it.
+	precision.cameraForward = forward.Unit
+	precision.cameraLocked = true
 
 	camera.CameraType = Enum.CameraType.Scriptable
 	cameraLock = RunService.RenderStepped:Connect(function()
@@ -2306,11 +2643,12 @@ local function startCameraLock()
 			return
 		end
 		local focus = root.Position + Vector3.new(0, 2, 0)
-		camera.CFrame = CFrame.lookAt(focus - forward * 12, focus)
+		camera.CFrame = CFrame.lookAt(focus - precision.cameraForward * 12, focus)
 	end)
 end
 
 local function stopCameraLock()
+	precision.cameraLocked = false
 	if cameraLock then
 		cameraLock:Disconnect()
 		cameraLock = nil
@@ -2545,7 +2883,14 @@ local function collectConfig()
 		goalTimeout     = CONFIG.PathGoalTimeout,
 		eggStayRadius   = CONFIG.EggStayRadius,
 		eggStallTimeout = CONFIG.EggStallTimeout,
-		eggSlowRadius   = CONFIG.EggSlowRadius,
+		precisionRange    = CONFIG.PrecisionRange,
+		correctionSlowMax = CONFIG.CorrectionSlowMax,
+		-- Learned coast times, so a fresh run starts already calibrated
+		-- instead of overshooting its first few eggs while it relearns.
+		precisionCalibration = {
+			stopTime = { table.unpack(precision.stopTime) },
+			samples  = precision.samples,
+		},
 		eggDamageGrace  = CONFIG.EggDamageGrace,
 		-- These counters are incremented live next to the session ones, so
 		-- they already include this run. Only runtime needs the session added,
@@ -2710,8 +3055,22 @@ local function applyConfig(cfg)
 	if type(cfg.eggStallTimeout) == "number" then
 		restore(UI.eggStallSlider, cfg.eggStallTimeout, function(v) CONFIG.EggStallTimeout = v end)
 	end
-	if type(cfg.eggSlowRadius) == "number" then
-		restore(UI.eggSlowSlider, cfg.eggSlowRadius, function(v) CONFIG.EggSlowRadius = v end)
+	if type(cfg.precisionRange) == "number" then
+		restore(UI.precisionRangeSlider, cfg.precisionRange, function(v) CONFIG.PrecisionRange = v end)
+	end
+	if type(cfg.correctionSlowMax) == "number" then
+		restore(UI.correctionSlowSlider, cfg.correctionSlowMax, function(v) CONFIG.CorrectionSlowMax = v end)
+	end
+	if type(cfg.precisionCalibration) == "table" and type(cfg.precisionCalibration.stopTime) == "table" then
+		for index, seconds in ipairs(cfg.precisionCalibration.stopTime) do
+			-- Same bounds the learner uses, so a corrupt file cannot wreck it.
+			if type(seconds) == "number" and precision.stopTime[index] then
+				precision.stopTime[index] = math.clamp(seconds, 0.01, 0.6)
+			end
+		end
+		if type(cfg.precisionCalibration.samples) == "number" then
+			precision.samples = cfg.precisionCalibration.samples
+		end
 	end
 	if type(cfg.eggDamageGrace) == "number" then
 		restore(UI.eggDamageGraceSlider, cfg.eggDamageGrace, function(v) CONFIG.EggDamageGrace = v end)
@@ -2905,7 +3264,6 @@ local httpRequest = (syn and syn.request)
 	or http_request
 	or request
 
-local WEBHOOK_MIN_GAP = 3
 local webhookQueue = {}
 local webhookBusy = false
 
@@ -2972,7 +3330,7 @@ local function queueWebhook(payload)
 			if not ok then
 				warn("[Autofarm] Webhook failed:", err)
 			end
-			task.wait(WEBHOOK_MIN_GAP)
+			task.wait(CONFIG.WEBHOOK_MIN_GAP)
 		end
 		webhookBusy = false
 	end)
@@ -3706,16 +4064,38 @@ UI.eggStaySlider = UI.MoveTab:CreateSlider({
 	end,
 })
 
-UI.eggSlowSlider = UI.MoveTab:CreateSlider({
-	Name = "Slow mode within",
-	Range = { 4, 60 },
-	Increment = 2,
+UI.precisionRangeSlider = UI.MoveTab:CreateSlider({
+	Name = "Precision approach from",
+	Range = { 10, 60 },
+	Increment = 5,
 	Suffix = " studs",
-	CurrentValue = CONFIG.EggSlowRadius,
-	Flag = "EggSlowRadius",
+	CurrentValue = CONFIG.PrecisionRange,
+	Flag = "PrecisionRange",
 	Callback = function(value)
-		CONFIG.EggSlowRadius = value
+		CONFIG.PrecisionRange = value
 		queueSave()
+	end,
+})
+
+UI.correctionSlowSlider = UI.MoveTab:CreateSlider({
+	Name = "Slow mode for corrections up to",
+	Range = { 0, 40 },
+	Increment = 1,
+	Suffix = " studs",
+	CurrentValue = CONFIG.CorrectionSlowMax,
+	Flag = "CorrectionSlowMax",
+	Callback = function(value)
+		CONFIG.CorrectionSlowMax = value
+		queueSave()
+	end,
+})
+
+UI.MoveTab:CreateButton({
+	Name = "Reset movement calibration",
+	Callback = function()
+		precision.resetCalibration()
+		queueSave()
+		notify("Movement", "Calibration reset; it relearns over the next few eggs")
 	end,
 })
 
@@ -4089,13 +4469,27 @@ task.spawn(function()
 				-- Show the real walk speed next to what the script believes, so a
 				-- game-side reset of slow mode is visible rather than hidden.
 				local _, hum = getCharacter()
+				local bands = {}
+				for index, seconds in ipairs(precision.stopTime) do
+					local low = precision.bands[index - 1] or 0
+					local high = precision.bands[index]
+					bands[#bands + 1] = string.format("%s: %.3fs",
+						high and string.format("%d-%d", low, high) or string.format("%d+", low),
+						seconds)
+				end
+
 				UI.slowModeParagraph:Set({
-					Title = "Slow mode",
-					Content = string.format("Remote: %s\nScript wants: %s\nActual walk speed: %s\nEngages within %d studs of the target egg.",
-						slowModeRemoteStatus,
+					Title = "Precision movement",
+					Content = string.format(
+						"Calibrated from %d stop(s)\nCoast time by speed (studs/s):\n  %s\nLast landing: %s at %.0f studs/s\n\nSlow mode: %s (walk speed %s)\nUsed only for corrections up to %d studs.\nRemote: %s",
+						precision.samples,
+						table.concat(bands, "\n  "),
+						precision.lastError and string.format("%.2f studs off", precision.lastError) or "none yet",
+						precision.lastSpeed or 0,
 						slowModeOn and "ON" or "off",
 						hum and string.format("%.1f", hum.WalkSpeed) or "?",
-						CONFIG.EggSlowRadius),
+						CONFIG.CorrectionSlowMax,
+						slowModeRemoteStatus),
 				})
 			end)
 
